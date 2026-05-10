@@ -83,7 +83,7 @@ def quantize_mxint_channel_blocks(
 
     This mirrors microxcaling's `_quantize_mx` path for integer element formats,
     but stops before the final dequantized-float reconstruction. It returns the
-    raw signed int8 payload and the integer shared exponent needed by the float
+    raw signed integer payload and the integer shared exponent needed by the float
     accumulator:
 
         microxcaling_mx_value == raw_int_element * 2 ** (shared_exp - (mbits - 2))
@@ -236,10 +236,11 @@ if triton is not None:
         pad_w: tl.constexpr,
         has_bias: tl.constexpr,
         block_size: tl.constexpr,
-        elem_mbits: tl.constexpr,
+        x_elem_mbits: tl.constexpr,
+        w_elem_mbits: tl.constexpr,
         BLOCK_M: tl.constexpr,
     ):
-        # Kernel step: dequantize each int8 product with its MX block exponents while accumulating.
+        # Kernel step: dequantize each integer product with its MX block exponents while accumulating.
         # Each Triton program owns BLOCK_M flattened output elements. The next
         # few lines decode each flat output index into N, output-channel,
         # output-row, and output-column coordinates.
@@ -279,12 +280,12 @@ if triton is not None:
                     w_elem = tl.load(w_q + w_offset, mask=spatial_mask, other=0).to(tl.float32)
                     x_exp = tl.load(x_s + x_scale_offset, mask=spatial_mask, other=0).to(tl.float32)
                     w_exp = tl.load(w_s + w_scale_offset, mask=spatial_mask, other=0).to(tl.float32)
-                    x_scale = tl.exp((x_exp - (elem_mbits - 2)) * 0.6931471805599453)
-                    w_scale = tl.exp((w_exp - (elem_mbits - 2)) * 0.6931471805599453)
+                    x_scale = tl.exp((x_exp - (x_elem_mbits - 2)) * 0.6931471805599453)
+                    w_scale = tl.exp((w_exp - (w_elem_mbits - 2)) * 0.6931471805599453)
 
                     # Core accumulator behavior:
-                    #   real_x ~= x_elem * exp2(x_shared_exp - (elem_mbits - 2))
-                    #   real_w ~= w_elem * exp2(w_shared_exp - (elem_mbits - 2))
+                    #   real_x ~= x_elem * exp2(x_shared_exp - (x_elem_mbits - 2))
+                    #   real_w ~= w_elem * exp2(w_shared_exp - (w_elem_mbits - 2))
                     #   acc += real_x * real_w
                     acc += x_elem * w_elem * x_scale * w_scale
 
@@ -328,11 +329,12 @@ def mxint8_conv2d_triton(
         raise ImportError("Triton is required for mxint8_conv2d_triton") from _TRITON_IMPORT_ERROR
     if x_mx.elements.device.type != "cuda" or w_mx.elements.device.type != "cuda":
         raise ValueError("MX Triton convolution expects CUDA tensors")
-    if x_mx.elem_format != w_mx.elem_format or x_mx.elem_mbits != w_mx.elem_mbits:
-        raise ValueError("Activation and weight MX integer formats must match")
-    expected_dtype = torch.int8 if x_mx.elem_format == "int8" else torch.int16
-    if x_mx.elements.dtype != expected_dtype or w_mx.elements.dtype != expected_dtype:
-        raise ValueError(f"MX Triton convolution expects {x_mx.elem_format} element tensors")
+    x_expected_dtype = torch.int8 if x_mx.elem_format == "int8" else torch.int16
+    w_expected_dtype = torch.int8 if w_mx.elem_format == "int8" else torch.int16
+    if x_mx.elements.dtype != x_expected_dtype:
+        raise ValueError(f"MX Triton convolution expects activation {x_mx.elem_format} element tensors")
+    if w_mx.elements.dtype != w_expected_dtype:
+        raise ValueError(f"MX Triton convolution expects weight {w_mx.elem_format} element tensors")
     if x_mx.scales.dtype.is_floating_point or w_mx.scales.dtype.is_floating_point:
         raise ValueError("MX Triton convolution expects integer shared exponent tensors")
     if x_mx.block_size != w_mx.block_size:
@@ -379,6 +381,7 @@ def mxint8_conv2d_triton(
         bias is not None,
         x_mx.block_size,
         x_mx.elem_mbits,
+        w_mx.elem_mbits,
         BLOCK_M=block_m,
     )
     return out

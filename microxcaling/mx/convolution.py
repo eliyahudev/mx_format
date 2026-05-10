@@ -120,8 +120,6 @@ class ConvFunction(torch.autograd.Function):
         supported_int_formats = ("int8", "int16")
         if mx_specs["a_elem_format"] not in supported_int_formats or mx_specs["w_elem_format"] not in supported_int_formats:
             raise ValueError("INT_OPS Conv2d currently supports only int8 or int16 element formats")
-        if mx_specs["a_elem_format"] != mx_specs["w_elem_format"]:
-            raise ValueError("INT_OPS Conv2d requires matching activation and weight integer formats")
         if mx_specs["shared_exp_method"] != "max":
             raise ValueError("INT_OPS Conv2d currently supports shared_exp_method='max'")
         if input.device.type != "cuda" or weight.device.type != "cuda":

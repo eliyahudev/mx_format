@@ -24,6 +24,12 @@ INT16_OPS_SPECS = dict(INT_OPS_SPECS)
 INT16_OPS_SPECS["w_elem_format"] = "int16"
 INT16_OPS_SPECS["a_elem_format"] = "int16"
 
+MIXED_A8_W16_OPS_SPECS = dict(INT_OPS_SPECS)
+MIXED_A8_W16_OPS_SPECS["w_elem_format"] = "int16"
+
+MIXED_A16_W8_OPS_SPECS = dict(INT_OPS_SPECS)
+MIXED_A16_W8_OPS_SPECS["a_elem_format"] = "int16"
+
 
 @unittest.skipIf(torch is None, "torch is required for INT_OPS Conv2d tests")
 class IntOpsConv2dTest(unittest.TestCase):
@@ -75,14 +81,29 @@ class IntOpsConv2dTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "only int8 or int16"):
             conv(x)
 
-    def test_int_ops_rejects_mixed_integer_widths(self):
-        specs = dict(INT_OPS_SPECS)
-        specs["w_elem_format"] = "int16"
-        conv = Conv2d(32, 8, kernel_size=3, padding=1, mx_specs=specs)
-        x = torch.randn(2, 32, 16, 16)
+    @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA is required")
+    def test_int_ops_accepts_activation_int8_weight_int16(self):
+        conv = Conv2d(32, 8, kernel_size=3, padding=1, mx_specs=MIXED_A8_W16_OPS_SPECS).cuda()
+        x = torch.randn(2, 32, 16, 16, device="cuda", requires_grad=True)
 
-        with self.assertRaisesRegex(ValueError, "matching activation and weight"):
-            conv(x)
+        y = conv(x)
+
+        self.assertEqual(tuple(y.shape), (2, 8, 16, 16))
+        self.assertEqual(y.dtype, torch.float32)
+        with self.assertRaisesRegex(NotImplementedError, "INT_OPS Conv2d backward"):
+            y.sum().backward()
+
+    @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA is required")
+    def test_int_ops_accepts_activation_int16_weight_int8(self):
+        conv = Conv2d(32, 8, kernel_size=3, padding=1, mx_specs=MIXED_A16_W8_OPS_SPECS).cuda()
+        x = torch.randn(2, 32, 16, 16, device="cuda", requires_grad=True)
+
+        y = conv(x)
+
+        self.assertEqual(tuple(y.shape), (2, 8, 16, 16))
+        self.assertEqual(y.dtype, torch.float32)
+        with self.assertRaisesRegex(NotImplementedError, "INT_OPS Conv2d backward"):
+            y.sum().backward()
 
     def test_int_ops_rejects_non_max_shared_exponent(self):
         specs = dict(INT_OPS_SPECS)
