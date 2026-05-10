@@ -11,8 +11,8 @@ except ModuleNotFoundError:
 
 INT_OPS_SPECS = {
     "scale_bits": 8,
-    "w_elem_format": "fp6_e3m2",
-    "a_elem_format": "fp6_e3m2",
+    "w_elem_format": "int8",
+    "a_elem_format": "int8",
     "block_size": 32,
     "bfloat": 16,
     "custom_cuda": False,
@@ -48,6 +48,24 @@ class IntOpsConv2dTest(unittest.TestCase):
         x = torch.randn(2, 32, 16, 16)
 
         with self.assertRaisesRegex(ValueError, "requires CUDA"):
+            conv(x)
+
+    def test_int_ops_rejects_non_int8_formats(self):
+        specs = dict(INT_OPS_SPECS)
+        specs["a_elem_format"] = "fp6_e3m2"
+        conv = Conv2d(32, 8, kernel_size=3, padding=1, mx_specs=specs)
+        x = torch.randn(2, 32, 16, 16)
+
+        with self.assertRaisesRegex(ValueError, "only a_elem_format='int8'"):
+            conv(x)
+
+    def test_int_ops_rejects_non_max_shared_exponent(self):
+        specs = dict(INT_OPS_SPECS)
+        specs["shared_exp_method"] = "none"
+        conv = Conv2d(32, 8, kernel_size=3, padding=1, mx_specs=specs)
+        x = torch.randn(2, 32, 16, 16)
+
+        with self.assertRaisesRegex(ValueError, "shared_exp_method='max'"):
             conv(x)
 
     @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA is required")

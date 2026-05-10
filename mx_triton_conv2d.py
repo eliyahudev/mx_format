@@ -20,13 +20,11 @@ Install requirements in a CUDA environment:
 
 from __future__ import annotations
 
-import math
 from copy import deepcopy
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 try:
     import triton
@@ -70,12 +68,19 @@ def quantize_mxint8_channel_blocks(
     *,
     axis: int,
     block_size: int = 32,
+    scale_bits: int = 8,
+    round: str = "nearest",
+    shared_exp_method: str = "max",
+    flush_fp32_subnorms: bool = False,
 ) -> MXInt8Tensor:
     """Quantize a tensor to raw int8 elements with one scale per channel block.
 
-    This is the first MX step before the Triton convolution. It splits the
-    channel dimension into fixed-size blocks, finds one max-abs scale per block,
-    divides each value by that scale, then rounds/clamps into int8 elements.
+    This mirrors microxcaling's `_quantize_mx` path for `elem_format="int8"`,
+    but stops before the final dequantized-float reconstruction. It returns the
+    raw signed int8 payload and the power-of-two dequant scale needed by the
+    float accumulator:
+
+        microxcaling_mx_value == raw_int8_element * dequant_scale
 
     The function returns raw integer elements and scales, not a dequantized
     float tensor. The later Triton kernel tests the accumulator path by doing:
@@ -92,6 +97,10 @@ def quantize_mxint8_channel_blocks(
         tensor: CUDA activation or weight tensor to quantize.
         axis: Channel axis to block. This example currently supports axis 1.
         block_size: Number of channels sharing one scale.
+        scale_bits: Number of bits used by the shared MX exponent.
+        round: Rounding mode passed to microxcaling's elementwise core.
+        shared_exp_method: Shared exponent method; currently expected to be "max".
+        flush_fp32_subnorms: Match microxcaling's optional subnormal flush.
 
     Returns:
         `MXInt8Tensor` with int8 elements and float32 block scales.
@@ -102,27 +111,61 @@ def quantize_mxint8_channel_blocks(
         axis += tensor.ndim
     if axis != 1:
         raise ValueError("This conv example currently supports channel axis=1")
+    if block_size <= 0:
+        raise ValueError("MXINT8 quantization expects block_size > 0")
+    if scale_bits <= 0:
+        raise ValueError("MXINT8 quantization expects scale_bits > 0")
+
+    from microxcaling.mx.elemwise_ops import _quantize_elemwise_core
+    from microxcaling.mx.formats import _get_format_params
+    from microxcaling.mx.mx_ops import _reshape_to_blocks, _shared_exponents, _undo_reshape_to_blocks
 
     tensor = tensor.contiguous()
-    moved = tensor.movedim(axis, -1)
-    original_channel_count = moved.shape[-1]
-    blocks = math.ceil(original_channel_count / block_size)
-    padded_channel_count = blocks * block_size
+    ebits, mbits, emax, max_norm, _ = _get_format_params("int8")
 
-    if padded_channel_count != original_channel_count:
-        moved = F.pad(moved, (0, padded_channel_count - original_channel_count))
+    blocked, blocked_axes, orig_shape, padded_shape = _reshape_to_blocks(
+        tensor,
+        [axis],
+        block_size,
+    )
+    shared_exp_axes = [x + 1 for x in blocked_axes]
+    shared_exp = _shared_exponents(
+        blocked,
+        method=shared_exp_method,
+        axes=shared_exp_axes,
+        ebits=0,
+    )
 
-    blocked = moved.reshape(*moved.shape[:-1], blocks, block_size)
-    max_abs = blocked.abs().amax(dim=-1, keepdim=True)
-    scale = torch.where(max_abs > 0, max_abs / 127.0, torch.ones_like(max_abs))
-    quantized = torch.clamp(torch.round(blocked / scale), -127, 127).to(torch.int8)
+    if flush_fp32_subnorms:
+        from microxcaling.mx.formats import FP32_EXPONENT_BIAS
 
-    quantized = quantized.reshape(*moved.shape[:-1], padded_channel_count)
-    quantized = quantized[..., :original_channel_count].movedim(-1, axis).contiguous()
-    scales = scale.squeeze(-1).movedim(-1, axis).contiguous()
+        blocked = blocked * (shared_exp > -FP32_EXPONENT_BIAS).type(blocked.dtype)
+
+    shared_exp = shared_exp - emax
+    scale_emax = 2 ** (scale_bits - 1) - 1
+    shared_exp = torch.where(shared_exp > scale_emax, torch.full_like(shared_exp, float("NaN")), shared_exp)
+    shared_exp = torch.clamp(shared_exp, min=-scale_emax)
+
+    normalized = blocked / (2**shared_exp)
+    quantized_mx_float = _quantize_elemwise_core(
+        normalized,
+        mbits,
+        ebits,
+        max_norm,
+        round=round,
+        allow_denorm=True,
+        saturate_normals=True,
+        custom_cuda=False,
+    )
+
+    int_scale = 2 ** (mbits - 2)
+    raw_int = torch.clamp(torch.round(quantized_mx_float * int_scale), -127, 127).to(torch.int8)
+    raw_int = _undo_reshape_to_blocks(raw_int, padded_shape, orig_shape, blocked_axes).contiguous()
+
+    scales = (2 ** (shared_exp - (mbits - 2))).squeeze(shared_exp_axes[0]).contiguous()
 
     return MXInt8Tensor(
-        elements=quantized,
+        elements=raw_int,
         scales=scales.to(torch.float32),
         block_size=block_size,
         axis=axis,

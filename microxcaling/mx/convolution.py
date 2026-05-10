@@ -117,6 +117,10 @@ class ConvFunction(torch.autograd.Function):
     def _validate_int_ops_conv2d(input, weight, stride, padding, dilation, groups, mx_specs):
         if input.ndim != 4 or weight.ndim != 4:
             raise ValueError("INT_OPS convolution currently supports Conv2d only")
+        if mx_specs["a_elem_format"] != "int8" or mx_specs["w_elem_format"] != "int8":
+            raise ValueError("INT_OPS Conv2d currently supports only a_elem_format='int8' and w_elem_format='int8'")
+        if mx_specs["shared_exp_method"] != "max":
+            raise ValueError("INT_OPS Conv2d currently supports shared_exp_method='max'")
         if input.device.type != "cuda" or weight.device.type != "cuda":
             raise ValueError("INT_OPS Conv2d requires CUDA input and weight tensors")
         if groups != 1:
@@ -191,11 +195,19 @@ class ConvFunction(torch.autograd.Function):
                 bf_in,
                 axis=1,
                 block_size=mx_specs["block_size"],
+                scale_bits=mx_specs["scale_bits"],
+                round=mx_specs["round_mx_output"],
+                shared_exp_method=mx_specs["shared_exp_method"],
+                flush_fp32_subnorms=mx_specs["mx_flush_fp32_subnorms"],
             )
             w_mx = quantize_mxint8_channel_blocks(
                 bf_weight,
                 axis=1,
                 block_size=mx_specs["block_size"],
+                scale_bits=mx_specs["scale_bits"],
+                round=mx_specs["round_mx_output"],
+                shared_exp_method=mx_specs["shared_exp_method"],
+                flush_fp32_subnorms=mx_specs["mx_flush_fp32_subnorms"],
             )
             output = mxint8_conv2d_triton(
                 x_mx,
