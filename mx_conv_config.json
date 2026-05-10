@@ -1,0 +1,20 @@
+{
+  "default": {
+    "scale_bits": 8,
+    "w_elem_format": "fp6_e3m2",
+    "a_elem_format": "fp6_e3m2",
+    "block_size": 32,
+    "bfloat": 16,
+    "custom_cuda": true,
+    "quantize_backprop": false
+  },
+  "layers": {
+    "conv1": {
+      "w_elem_format": "fp8_e4m3",
+      "a_elem_format": "fp8_e4m3"
+    },
+    "features.0": {
+      "block_size": 16
+    }
+  }
+}

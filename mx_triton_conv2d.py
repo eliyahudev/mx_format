@@ -1,0 +1,460 @@
+"""Triton Conv2d over raw MX-style quantized tensors.
+
+This example is intentionally narrower than Microsoft's `microxcaling` layers:
+it keeps activations and weights as integer MX elements plus shared block scales,
+then applies those scales inside a Triton convolution accumulator.
+
+The implemented format is MXINT8-style:
+    real_value ~= int8_element * shared_block_scale
+
+Supported convolution shape for this example:
+    - NCHW activations
+    - OIHW weights
+    - groups == 1
+    - dilation == 1
+    - square or tuple stride/padding
+
+Install requirements in a CUDA environment:
+    pip install torch triton
+"""
+
+from __future__ import annotations
+
+import math
+from copy import deepcopy
+from dataclasses import dataclass
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+try:
+    import triton
+    import triton.language as tl
+except ImportError as exc:  # pragma: no cover - import guard for CPU-only envs
+    triton = None
+    tl = None
+    _TRITON_IMPORT_ERROR = exc
+else:
+    _TRITON_IMPORT_ERROR = None
+
+
+@dataclass(frozen=True)
+class MXInt8Tensor:
+    """Raw MXINT8-style tensor: int8 elements plus per-channel-block scales.
+
+    `elements` is the low-precision integer tensor. `scales` is the matching
+    shared scale tensor. A real value is represented conceptually as
+    `element * matching_block_scale`.
+
+    Keeping these pieces separate is the whole point of this experiment: the
+    Triton kernel can load raw elements and scales, apply them inside the
+    accumulator, and avoid dequantizing the full tensor before convolution.
+    """
+
+    elements: torch.Tensor
+    scales: torch.Tensor
+    block_size: int
+    axis: int
+
+
+def _pair(value: int | tuple[int, int]) -> tuple[int, int]:
+    """Normalize Conv2d arguments so later code can always unpack H/W values."""
+    if isinstance(value, tuple):
+        return value
+    return value, value
+
+
+def quantize_mxint8_channel_blocks(
+    tensor: torch.Tensor,
+    *,
+    axis: int,
+    block_size: int = 32,
+) -> MXInt8Tensor:
+    """Quantize a tensor to raw int8 elements with one scale per channel block.
+
+    This is the first MX step before the Triton convolution. It splits the
+    channel dimension into fixed-size blocks, finds one max-abs scale per block,
+    divides each value by that scale, then rounds/clamps into int8 elements.
+
+    The function returns raw integer elements and scales, not a dequantized
+    float tensor. The later Triton kernel tests the accumulator path by doing:
+
+        acc += x_elem * w_elem * x_scale * w_scale
+
+    For NCHW activations use axis=1, producing scales of shape
+    [N, ceil(C / block_size), H, W].
+
+    For OIHW weights use axis=1, producing scales of shape
+    [O, ceil(I / block_size), H, W].
+
+    Args:
+        tensor: CUDA activation or weight tensor to quantize.
+        axis: Channel axis to block. This example currently supports axis 1.
+        block_size: Number of channels sharing one scale.
+
+    Returns:
+        `MXInt8Tensor` with int8 elements and float32 block scales.
+    """
+    if tensor.device.type != "cuda":
+        raise ValueError("MX Triton quantization expects a CUDA tensor")
+    if axis < 0:
+        axis += tensor.ndim
+    if axis != 1:
+        raise ValueError("This conv example currently supports channel axis=1")
+
+    tensor = tensor.contiguous()
+    moved = tensor.movedim(axis, -1)
+    original_channel_count = moved.shape[-1]
+    blocks = math.ceil(original_channel_count / block_size)
+    padded_channel_count = blocks * block_size
+
+    if padded_channel_count != original_channel_count:
+        moved = F.pad(moved, (0, padded_channel_count - original_channel_count))
+
+    blocked = moved.reshape(*moved.shape[:-1], blocks, block_size)
+    max_abs = blocked.abs().amax(dim=-1, keepdim=True)
+    scale = torch.where(max_abs > 0, max_abs / 127.0, torch.ones_like(max_abs))
+    quantized = torch.clamp(torch.round(blocked / scale), -127, 127).to(torch.int8)
+
+    quantized = quantized.reshape(*moved.shape[:-1], padded_channel_count)
+    quantized = quantized[..., :original_channel_count].movedim(-1, axis).contiguous()
+    scales = scale.squeeze(-1).movedim(-1, axis).contiguous()
+
+    return MXInt8Tensor(
+        elements=quantized,
+        scales=scales.to(torch.float32),
+        block_size=block_size,
+        axis=axis,
+    )
+
+
+if triton is not None:
+
+    @triton.jit
+    def _mxint8_conv2d_kernel(
+        x_q,
+        x_s,
+        w_q,
+        w_s,
+        bias,
+        out,
+        total_outputs: tl.constexpr,
+        n: tl.constexpr,
+        c: tl.constexpr,
+        h: tl.constexpr,
+        width: tl.constexpr,
+        oc: tl.constexpr,
+        kh: tl.constexpr,
+        kw: tl.constexpr,
+        out_h: tl.constexpr,
+        out_w: tl.constexpr,
+        stride_h: tl.constexpr,
+        stride_w: tl.constexpr,
+        pad_h: tl.constexpr,
+        pad_w: tl.constexpr,
+        has_bias: tl.constexpr,
+        block_size: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+    ):
+        # Kernel step: dequantize each int8 product with its MX block scales while accumulating.
+        # Each Triton program owns BLOCK_M flattened output elements. The next
+        # few lines decode each flat output index into N, output-channel,
+        # output-row, and output-column coordinates.
+        offsets = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+        mask = offsets < total_outputs
+
+        ow_idx = offsets % out_w
+        tmp = offsets // out_w
+        oh_idx = tmp % out_h
+        tmp = tmp // out_h
+        oc_idx = tmp % oc
+        n_idx = tmp // oc
+
+        acc = tl.zeros((BLOCK_M,), tl.float32)
+
+        # Walk over the convolution window and input channels. Padding is
+        # handled with masks so invalid input positions contribute zero.
+        for r in range(0, kh):
+            ih_idx = oh_idx * stride_h + r - pad_h
+            valid_h = (ih_idx >= 0) & (ih_idx < h)
+
+            for s in range(0, kw):
+                iw_idx = ow_idx * stride_w + s - pad_w
+                valid_w = (iw_idx >= 0) & (iw_idx < width)
+                spatial_mask = mask & valid_h & valid_w
+
+                for ci in range(0, c):
+                    cb = ci // block_size
+
+                    x_offset = ((n_idx * c + ci) * h + ih_idx) * width + iw_idx
+                    w_offset = ((oc_idx * c + ci) * kh + r) * kw + s
+
+                    x_scale_offset = ((n_idx * tl.cdiv(c, block_size) + cb) * h + ih_idx) * width + iw_idx
+                    w_scale_offset = ((oc_idx * tl.cdiv(c, block_size) + cb) * kh + r) * kw + s
+
+                    x_elem = tl.load(x_q + x_offset, mask=spatial_mask, other=0).to(tl.float32)
+                    w_elem = tl.load(w_q + w_offset, mask=spatial_mask, other=0).to(tl.float32)
+                    x_scale = tl.load(x_s + x_scale_offset, mask=spatial_mask, other=0.0)
+                    w_scale = tl.load(w_s + w_scale_offset, mask=spatial_mask, other=0.0)
+
+                    # Core accumulator behavior:
+                    #   real_x ~= x_elem * x_scale
+                    #   real_w ~= w_elem * w_scale
+                    #   acc += real_x * real_w
+                    acc += x_elem * w_elem * x_scale * w_scale
+
+        if has_bias:
+            acc += tl.load(bias + oc_idx, mask=mask, other=0.0)
+
+        tl.store(out + offsets, acc, mask=mask)
+
+
+def mxint8_conv2d_triton(
+    x_mx: MXInt8Tensor,
+    w_mx: MXInt8Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    stride: int | tuple[int, int] = 1,
+    padding: int | tuple[int, int] = 0,
+    block_m: int = 128,
+) -> torch.Tensor:
+    """Run Conv2d on raw MXINT8 elements and scales with a Triton accumulator.
+
+    At this point activations and weights are already quantized. This function
+    validates the MX tensors, computes the output shape, launches the Triton
+    kernel, and returns a float32 output tensor.
+
+    This is the public low-level API for accumulator experiments. It does not
+    call `torch.nn.functional.conv2d`, and it does not reconstruct full float
+    activation or weight tensors before computing.
+
+    Args:
+        x_mx: Quantized NCHW activation tensor.
+        w_mx: Quantized OIHW weight tensor.
+        bias: Optional float bias with one value per output channel.
+        stride: Conv2d stride as an int or `(height, width)` tuple.
+        padding: Conv2d zero padding as an int or `(height, width)` tuple.
+        block_m: Number of output elements computed by one Triton program.
+
+    Returns:
+        Float32 convolution output with shape `[N, out_channels, out_h, out_w]`.
+    """
+    if triton is None:
+        raise ImportError("Triton is required for mxint8_conv2d_triton") from _TRITON_IMPORT_ERROR
+    if x_mx.elements.device.type != "cuda" or w_mx.elements.device.type != "cuda":
+        raise ValueError("MX Triton convolution expects CUDA tensors")
+    if x_mx.block_size != w_mx.block_size:
+        raise ValueError("Activation and weight block sizes must match")
+    if x_mx.axis != 1 or w_mx.axis != 1:
+        raise ValueError("This example expects MX blocks along channel axis 1")
+
+    stride_h, stride_w = _pair(stride)
+    pad_h, pad_w = _pair(padding)
+
+    n, c, h, width = x_mx.elements.shape
+    oc, weight_c, kh, kw = w_mx.elements.shape
+    if c != weight_c:
+        raise ValueError(f"Input channels ({c}) must match weight channels ({weight_c})")
+
+    out_h = (h + 2 * pad_h - kh) // stride_h + 1
+    out_w = (width + 2 * pad_w - kw) // stride_w + 1
+    out = torch.empty((n, oc, out_h, out_w), device=x_mx.elements.device, dtype=torch.float32)
+    total_outputs = out.numel()
+    bias_arg = bias if bias is not None else out
+
+    grid = (triton.cdiv(total_outputs, block_m),)
+    _mxint8_conv2d_kernel[grid](
+        x_mx.elements,
+        x_mx.scales,
+        w_mx.elements,
+        w_mx.scales,
+        bias_arg,
+        out,
+        total_outputs,
+        n,
+        c,
+        h,
+        width,
+        oc,
+        kh,
+        kw,
+        out_h,
+        out_w,
+        stride_h,
+        stride_w,
+        pad_h,
+        pad_w,
+        bias is not None,
+        x_mx.block_size,
+        BLOCK_M=block_m,
+    )
+    return out
+
+
+class MXInt8TritonConv2d(nn.Module):
+    """Drop-in Conv2d wrapper that quantizes inputs/weights before Triton conv.
+
+    Use `from_conv2d` to replace a supported `nn.Conv2d` while preserving the
+    original layer's weights, bias, stride, padding, and train/eval state.
+
+    The module stores normal floating-point PyTorch parameters. During
+    `forward`, it quantizes the current activation tensor and current weight
+    tensor to `MXInt8Tensor`, calls the Triton accumulator kernel, and returns
+    the final float32 output. This is meant for inference-style accumulator
+    experiments, not as a full training-ready layer.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int | tuple[int, int],
+        *,
+        stride: int | tuple[int, int] = 1,
+        padding: int | tuple[int, int] = 0,
+        bias: bool = True,
+        block_size: int = 32,
+    ) -> None:
+        """Create the wrapper module with Conv2d-shaped parameters.
+
+        The parameters remain floating-point here. Quantization happens inside
+        `forward` so the wrapper can be built directly from an existing Conv2d.
+        """
+        super().__init__()
+        kernel_h, kernel_w = _pair(kernel_size)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = (kernel_h, kernel_w)
+        self.stride = _pair(stride)
+        self.padding = _pair(padding)
+        self.block_size = block_size
+
+        self.weight = nn.Parameter(torch.empty(out_channels, in_channels, kernel_h, kernel_w))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_channels))
+        else:
+            self.register_parameter("bias", None)
+
+    @classmethod
+    def from_conv2d(cls, conv: nn.Conv2d, *, block_size: int = 32) -> "MXInt8TritonConv2d":
+        """Convert one supported `nn.Conv2d` into the MXINT8 Triton wrapper.
+
+        Replacement step for a single layer:
+        validate the Conv2d options this example supports, construct the wrapper,
+        copy weights/bias, and keep the source module's training mode.
+
+        Supported options are intentionally narrow: `groups == 1`, dilation of
+        1, and zero padding. Unsupported settings raise immediately so a model
+        conversion does not silently change convolution semantics.
+        """
+        if conv.groups != 1:
+            raise ValueError("MXInt8TritonConv2d currently supports groups == 1")
+        if _pair(conv.dilation) != (1, 1):
+            raise ValueError("MXInt8TritonConv2d currently supports dilation == 1")
+        if getattr(conv, "padding_mode", "zeros") != "zeros":
+            raise ValueError("MXInt8TritonConv2d currently supports zero padding only")
+
+        module = cls(
+            conv.in_channels,
+            conv.out_channels,
+            conv.kernel_size,
+            stride=conv.stride,
+            padding=conv.padding,
+            bias=conv.bias is not None,
+            block_size=block_size,
+        )
+        module.to(device=conv.weight.device, dtype=conv.weight.dtype)
+        with torch.no_grad():
+            module.weight.copy_(conv.weight)
+            module.weight.requires_grad_(conv.weight.requires_grad)
+            if conv.bias is not None and module.bias is not None:
+                module.bias.copy_(conv.bias)
+                module.bias.requires_grad_(conv.bias.requires_grad)
+        module.train(conv.training)
+        return module
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Quantize activation and weight tensors, then run the MXINT8 conv.
+
+        The output is already finalized as float32 because the Triton kernel
+        accumulates into float32 and stores a float output. The intermediate
+        activation and weight tensors remain raw int8+scale pairs.
+        """
+        # Step 1: quantize the current activation tensor into int8 blocks.
+        x_mx = quantize_mxint8_channel_blocks(x, axis=1, block_size=self.block_size)
+        # Step 2: quantize this layer's floating-point weights the same way.
+        w_mx = quantize_mxint8_channel_blocks(self.weight, axis=1, block_size=self.block_size)
+        # Step 3: call the Triton convolution that applies scales during accumulation.
+        return mxint8_conv2d_triton(
+            x_mx,
+            w_mx,
+            self.bias,
+            stride=self.stride,
+            padding=self.padding,
+        )
+
+
+def replace_conv2d_with_mxint8_triton(
+    model: nn.Module,
+    *,
+    block_size: int = 32,
+    inplace: bool = False,
+) -> nn.Module:
+    """Replace supported `nn.Conv2d` layers with Triton MXINT8 accumulator layers.
+
+    Model replacement flow:
+    optionally deep-copy the model, walk every child module recursively, replace
+    each supported Conv2d with `MXInt8TritonConv2d.from_conv2d`, and leave all
+    non-convolution modules unchanged.
+
+    Args:
+        model: Any PyTorch module tree.
+        block_size: Number of channels sharing one MX scale.
+        inplace: If true, mutate `model`; otherwise convert a deep copy.
+
+    Returns:
+        A model with supported Conv2d layers replaced by Triton MX wrappers.
+    """
+    converted = model if inplace else deepcopy(model)
+
+    for module_name, child in list(converted.named_children()):
+        if type(child) is nn.Conv2d:
+            setattr(
+                converted,
+                module_name,
+                MXInt8TritonConv2d.from_conv2d(child, block_size=block_size),
+            )
+        else:
+            replace_conv2d_with_mxint8_triton(child, block_size=block_size, inplace=True)
+
+    return converted
+
+
+def example_usage() -> None:
+    """Minimal smoke-test showing quantize -> MX conv -> compare with fp32 conv.
+
+    This is a quick sanity check for a CUDA environment. It creates one input,
+    one weight tensor, and one bias vector; runs the raw MXINT8 Triton path; and
+    compares the final float output to ordinary PyTorch fp32 convolution.
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError("This example requires CUDA")
+
+    torch.manual_seed(0)
+    x = torch.randn(1, 32, 16, 16, device="cuda")
+    weight = torch.randn(8, 32, 3, 3, device="cuda")
+    bias = torch.randn(8, device="cuda")
+
+    x_mx = quantize_mxint8_channel_blocks(x, axis=1, block_size=32)
+    w_mx = quantize_mxint8_channel_blocks(weight, axis=1, block_size=32)
+
+    y_mx = mxint8_conv2d_triton(x_mx, w_mx, bias, stride=1, padding=1)
+    y_ref = F.conv2d(x, weight, bias, stride=1, padding=1)
+
+    print("output shape:", tuple(y_mx.shape))
+    print("mean abs diff vs fp32 conv:", (y_ref - y_mx).abs().mean().item())
+
+
+if __name__ == "__main__":
+    example_usage()
