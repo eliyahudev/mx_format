@@ -192,6 +192,11 @@ class ConvFunction(torch.autograd.Function):
                 input, weight, stride, padding, dilation, groups, mx_specs
             )
 
+            if mx_specs["quantize_backprop"]:
+                ctx.save_for_backward(bf_in, bf_weight)
+            else:
+                ctx.save_for_backward(input, weight)
+
             x_mx = quantize_mxint_channel_blocks(
                 bf_in,
                 axis=1,
@@ -223,6 +228,7 @@ class ConvFunction(torch.autograd.Function):
                 output, mx_specs=mx_specs, round=mx_specs["round_output"]
             )
             ctx.int_ops_forward_only = True
+            ctx.mx_specs = get_backwards_mx_specs(mx_specs)
             return output
 
         # save context after quantize
@@ -265,9 +271,6 @@ class ConvFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        if getattr(ctx, "int_ops_forward_only", False):
-            raise NotImplementedError("INT_OPS Conv2d backward is not implemented yet")
-
         assert grad_output.shape[1] % ctx.groups == 0
 
         # load context
