@@ -35,9 +35,12 @@ class MXTritonQuantizeTest(unittest.TestCase):
         )
 
         scale_index = torch.arange(x.shape[1], device=x.device) // raw.block_size
-        expanded_scales = raw.scales.index_select(1, scale_index)
+        expanded_exponents = raw.scales.index_select(1, scale_index)
+        expanded_scales = torch.exp2(expanded_exponents.float() - 6.0)
         reconstructed = raw.elements.float() * expanded_scales
 
+        self.assertEqual(raw.elements.dtype, torch.int8)
+        self.assertFalse(raw.scales.dtype.is_floating_point)
         self.assertTrue(torch.allclose(reconstructed, reference, equal_nan=True))
 
 

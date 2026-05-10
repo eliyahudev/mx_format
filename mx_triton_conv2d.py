@@ -1,8 +1,8 @@
 """Triton Conv2d over raw MX-style quantized tensors.
 
 This example is intentionally narrower than Microsoft's `microxcaling` layers:
-it keeps activations and weights as integer MX elements plus shared block scales,
-then applies those scales inside a Triton convolution accumulator.
+it keeps activations and weights as integer MX elements plus shared exponent
+blocks, then applies those exponents inside a Triton convolution accumulator.
 
 The implemented format is MXINT8-style:
     real_value ~= int8_element * shared_block_scale
@@ -39,14 +39,14 @@ else:
 
 @dataclass(frozen=True)
 class MXInt8Tensor:
-    """Raw MXINT8-style tensor: int8 elements plus per-channel-block scales.
+    """Raw MXINT8-style tensor: int8 elements plus per-channel-block exponents.
 
-    `elements` is the low-precision integer tensor. `scales` is the matching
-    shared scale tensor. A real value is represented conceptually as
-    `element * matching_block_scale`.
+    `elements` is the low-precision integer tensor. `scales` keeps its name for
+    compatibility, but stores integer shared exponents. A real value is
+    represented conceptually as `element * 2 ** (shared_exp - 6)` for MXINT8.
 
     Keeping these pieces separate is the whole point of this experiment: the
-    Triton kernel can load raw elements and scales, apply them inside the
+    Triton kernel can load raw elements and exponents, apply them inside the
     accumulator, and avoid dequantizing the full tensor before convolution.
     """
 
@@ -77,15 +77,15 @@ def quantize_mxint8_channel_blocks(
 
     This mirrors microxcaling's `_quantize_mx` path for `elem_format="int8"`,
     but stops before the final dequantized-float reconstruction. It returns the
-    raw signed int8 payload and the power-of-two dequant scale needed by the
-    float accumulator:
+    raw signed int8 payload and the integer shared exponent needed by the float
+    accumulator:
 
-        microxcaling_mx_value == raw_int8_element * dequant_scale
+        microxcaling_mx_value == raw_int8_element * 2 ** (shared_exp - 6)
 
-    The function returns raw integer elements and scales, not a dequantized
+    The function returns raw integer elements and exponents, not a dequantized
     float tensor. The later Triton kernel tests the accumulator path by doing:
 
-        acc += x_elem * w_elem * x_scale * w_scale
+        acc += x_elem * w_elem * exp2(x_exp - 6) * exp2(w_exp - 6)
 
     For NCHW activations use axis=1, producing scales of shape
     [N, ceil(C / block_size), H, W].
@@ -103,7 +103,7 @@ def quantize_mxint8_channel_blocks(
         flush_fp32_subnorms: Match microxcaling's optional subnormal flush.
 
     Returns:
-        `MXInt8Tensor` with int8 elements and float32 block scales.
+        `MXInt8Tensor` with int8 elements and int16 shared exponents.
     """
     if tensor.device.type != "cuda":
         raise ValueError("MX Triton quantization expects a CUDA tensor")
@@ -143,7 +143,8 @@ def quantize_mxint8_channel_blocks(
 
     shared_exp = shared_exp - emax
     scale_emax = 2 ** (scale_bits - 1) - 1
-    shared_exp = torch.where(shared_exp > scale_emax, torch.full_like(shared_exp, float("NaN")), shared_exp)
+    if torch.any(shared_exp > scale_emax):
+        raise ValueError("MXINT8 shared exponent overflow for configured scale_bits")
     shared_exp = torch.clamp(shared_exp, min=-scale_emax)
 
     normalized = blocked / (2**shared_exp)
@@ -162,11 +163,11 @@ def quantize_mxint8_channel_blocks(
     raw_int = torch.clamp(torch.round(quantized_mx_float * int_scale), -127, 127).to(torch.int8)
     raw_int = _undo_reshape_to_blocks(raw_int, padded_shape, orig_shape, blocked_axes).contiguous()
 
-    scales = (2 ** (shared_exp - (mbits - 2))).squeeze(shared_exp_axes[0]).contiguous()
+    shared_exp = shared_exp.squeeze(shared_exp_axes[0]).to(torch.int16).contiguous()
 
     return MXInt8Tensor(
         elements=raw_int,
-        scales=scales.to(torch.float32),
+        scales=shared_exp,
         block_size=block_size,
         axis=axis,
     )
@@ -200,7 +201,7 @@ if triton is not None:
         block_size: tl.constexpr,
         BLOCK_M: tl.constexpr,
     ):
-        # Kernel step: dequantize each int8 product with its MX block scales while accumulating.
+        # Kernel step: dequantize each int8 product with its MX block exponents while accumulating.
         # Each Triton program owns BLOCK_M flattened output elements. The next
         # few lines decode each flat output index into N, output-channel,
         # output-row, and output-column coordinates.
@@ -238,12 +239,14 @@ if triton is not None:
 
                     x_elem = tl.load(x_q + x_offset, mask=spatial_mask, other=0).to(tl.float32)
                     w_elem = tl.load(w_q + w_offset, mask=spatial_mask, other=0).to(tl.float32)
-                    x_scale = tl.load(x_s + x_scale_offset, mask=spatial_mask, other=0.0)
-                    w_scale = tl.load(w_s + w_scale_offset, mask=spatial_mask, other=0.0)
+                    x_exp = tl.load(x_s + x_scale_offset, mask=spatial_mask, other=0).to(tl.float32)
+                    w_exp = tl.load(w_s + w_scale_offset, mask=spatial_mask, other=0).to(tl.float32)
+                    x_scale = tl.exp2(x_exp - 6.0)
+                    w_scale = tl.exp2(w_exp - 6.0)
 
                     # Core accumulator behavior:
-                    #   real_x ~= x_elem * x_scale
-                    #   real_w ~= w_elem * w_scale
+                    #   real_x ~= x_elem * exp2(x_shared_exp - 6)
+                    #   real_w ~= w_elem * exp2(w_shared_exp - 6)
                     #   acc += real_x * real_w
                     acc += x_elem * w_elem * x_scale * w_scale
 
@@ -287,6 +290,10 @@ def mxint8_conv2d_triton(
         raise ImportError("Triton is required for mxint8_conv2d_triton") from _TRITON_IMPORT_ERROR
     if x_mx.elements.device.type != "cuda" or w_mx.elements.device.type != "cuda":
         raise ValueError("MX Triton convolution expects CUDA tensors")
+    if x_mx.elements.dtype != torch.int8 or w_mx.elements.dtype != torch.int8:
+        raise ValueError("MX Triton convolution expects int8 element tensors")
+    if x_mx.scales.dtype.is_floating_point or w_mx.scales.dtype.is_floating_point:
+        raise ValueError("MX Triton convolution expects integer shared exponent tensors")
     if x_mx.block_size != w_mx.block_size:
         raise ValueError("Activation and weight block sizes must match")
     if x_mx.axis != 1 or w_mx.axis != 1:
