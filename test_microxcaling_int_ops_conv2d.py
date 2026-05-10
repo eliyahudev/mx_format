@@ -20,12 +20,28 @@ INT_OPS_SPECS = {
     "int_ops": True,
 }
 
+INT16_OPS_SPECS = dict(INT_OPS_SPECS)
+INT16_OPS_SPECS["w_elem_format"] = "int16"
+INT16_OPS_SPECS["a_elem_format"] = "int16"
+
 
 @unittest.skipIf(torch is None, "torch is required for INT_OPS Conv2d tests")
 class IntOpsConv2dTest(unittest.TestCase):
     @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA is required")
     def test_int_ops_conv2d_forward_and_backward_error(self):
         conv = Conv2d(32, 8, kernel_size=3, padding=1, mx_specs=INT_OPS_SPECS).cuda()
+        x = torch.randn(2, 32, 16, 16, device="cuda", requires_grad=True)
+
+        y = conv(x)
+
+        self.assertEqual(tuple(y.shape), (2, 8, 16, 16))
+        self.assertEqual(y.dtype, torch.float32)
+        with self.assertRaisesRegex(NotImplementedError, "INT_OPS Conv2d backward"):
+            y.sum().backward()
+
+    @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA is required")
+    def test_int16_ops_conv2d_forward_and_backward_error(self):
+        conv = Conv2d(32, 8, kernel_size=3, padding=1, mx_specs=INT16_OPS_SPECS).cuda()
         x = torch.randn(2, 32, 16, 16, device="cuda", requires_grad=True)
 
         y = conv(x)
@@ -50,13 +66,22 @@ class IntOpsConv2dTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires CUDA"):
             conv(x)
 
-    def test_int_ops_rejects_non_int8_formats(self):
+    def test_int_ops_rejects_non_integer_formats(self):
         specs = dict(INT_OPS_SPECS)
         specs["a_elem_format"] = "fp6_e3m2"
         conv = Conv2d(32, 8, kernel_size=3, padding=1, mx_specs=specs)
         x = torch.randn(2, 32, 16, 16)
 
-        with self.assertRaisesRegex(ValueError, "only a_elem_format='int8'"):
+        with self.assertRaisesRegex(ValueError, "only int8 or int16"):
+            conv(x)
+
+    def test_int_ops_rejects_mixed_integer_widths(self):
+        specs = dict(INT_OPS_SPECS)
+        specs["w_elem_format"] = "int16"
+        conv = Conv2d(32, 8, kernel_size=3, padding=1, mx_specs=specs)
+        x = torch.randn(2, 32, 16, 16)
+
+        with self.assertRaisesRegex(ValueError, "matching activation and weight"):
             conv(x)
 
     def test_int_ops_rejects_non_max_shared_exponent(self):

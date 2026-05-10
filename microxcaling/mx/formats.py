@@ -23,6 +23,7 @@ class ElemFormat(Enum):
     int8 = 1
     int4 = 2
     int2 = 3
+    int16 = 11
     fp8_e5m2 = 4
     fp8_e4m3 = 5
     fp6_e3m2 = 6
@@ -80,7 +81,10 @@ def _get_format_params(fmt):
     if fmt in _FORMAT_CACHE:
         return _FORMAT_CACHE[fmt]
 
-    if fmt == ElemFormat.int8:
+    if fmt == ElemFormat.int16:
+        ebits, mbits = 0, 16
+        emax = 0
+    elif fmt == ElemFormat.int8:
         ebits, mbits = 0, 8
         emax = 0
     elif fmt == ElemFormat.int4:

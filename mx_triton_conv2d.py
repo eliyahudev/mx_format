@@ -4,8 +4,8 @@ This example is intentionally narrower than Microsoft's `microxcaling` layers:
 it keeps activations and weights as integer MX elements plus shared exponent
 blocks, then applies those exponents inside a Triton convolution accumulator.
 
-The implemented format is MXINT8-style:
-    real_value ~= int8_element * shared_block_scale
+The implemented formats are MXINT8/MXINT16-style:
+    real_value ~= int_element * 2 ** (shared_exp - (element_bits - 2))
 
 Supported convolution shape for this example:
     - NCHW activations
@@ -38,12 +38,12 @@ else:
 
 
 @dataclass(frozen=True)
-class MXInt8Tensor:
-    """Raw MXINT8-style tensor: int8 elements plus per-channel-block exponents.
+class MXIntTensor:
+    """Raw MXINT-style tensor: integer elements plus per-channel-block exponents.
 
     `elements` is the low-precision integer tensor. `scales` keeps its name for
     compatibility, but stores integer shared exponents. A real value is
-    represented conceptually as `element * 2 ** (shared_exp - 6)` for MXINT8.
+    represented conceptually as `element * 2 ** (shared_exp - (elem_mbits - 2))`.
 
     Keeping these pieces separate is the whole point of this experiment: the
     Triton kernel can load raw elements and exponents, apply them inside the
@@ -54,6 +54,11 @@ class MXInt8Tensor:
     scales: torch.Tensor
     block_size: int
     axis: int
+    elem_format: str
+    elem_mbits: int
+
+
+MXInt8Tensor = MXIntTensor
 
 
 def _pair(value: int | tuple[int, int]) -> tuple[int, int]:
@@ -63,29 +68,30 @@ def _pair(value: int | tuple[int, int]) -> tuple[int, int]:
     return value, value
 
 
-def quantize_mxint8_channel_blocks(
+def quantize_mxint_channel_blocks(
     tensor: torch.Tensor,
     *,
     axis: int,
+    elem_format: str = "int8",
     block_size: int = 32,
     scale_bits: int = 8,
     round: str = "nearest",
     shared_exp_method: str = "max",
     flush_fp32_subnorms: bool = False,
-) -> MXInt8Tensor:
-    """Quantize a tensor to raw int8 elements with one scale per channel block.
+) -> MXIntTensor:
+    """Quantize a tensor to raw MX integer elements and shared exponents.
 
-    This mirrors microxcaling's `_quantize_mx` path for `elem_format="int8"`,
+    This mirrors microxcaling's `_quantize_mx` path for integer element formats,
     but stops before the final dequantized-float reconstruction. It returns the
     raw signed int8 payload and the integer shared exponent needed by the float
     accumulator:
 
-        microxcaling_mx_value == raw_int8_element * 2 ** (shared_exp - 6)
+        microxcaling_mx_value == raw_int_element * 2 ** (shared_exp - (mbits - 2))
 
     The function returns raw integer elements and exponents, not a dequantized
     float tensor. The later Triton kernel tests the accumulator path by doing:
 
-        acc += x_elem * w_elem * exp2(x_exp - 6) * exp2(w_exp - 6)
+        acc += x_elem * w_elem * exp2(x_exp - offset) * exp2(w_exp - offset)
 
     For NCHW activations use axis=1, producing scales of shape
     [N, ceil(C / block_size), H, W].
@@ -96,6 +102,7 @@ def quantize_mxint8_channel_blocks(
     Args:
         tensor: CUDA activation or weight tensor to quantize.
         axis: Channel axis to block. This example currently supports axis 1.
+        elem_format: Integer MX element format. Supported: "int8" or "int16".
         block_size: Number of channels sharing one scale.
         scale_bits: Number of bits used by the shared MX exponent.
         round: Rounding mode passed to microxcaling's elementwise core.
@@ -103,7 +110,7 @@ def quantize_mxint8_channel_blocks(
         flush_fp32_subnorms: Match microxcaling's optional subnormal flush.
 
     Returns:
-        `MXInt8Tensor` with int8 elements and int16 shared exponents.
+        `MXIntTensor` with integer elements and int16 shared exponents.
     """
     if tensor.device.type != "cuda":
         raise ValueError("MX Triton quantization expects a CUDA tensor")
@@ -111,17 +118,19 @@ def quantize_mxint8_channel_blocks(
         axis += tensor.ndim
     if axis != 1:
         raise ValueError("This conv example currently supports channel axis=1")
+    if elem_format not in ("int8", "int16"):
+        raise ValueError("MX Triton quantization currently supports elem_format 'int8' or 'int16'")
     if block_size <= 0:
-        raise ValueError("MXINT8 quantization expects block_size > 0")
+        raise ValueError("MXINT quantization expects block_size > 0")
     if scale_bits <= 0:
-        raise ValueError("MXINT8 quantization expects scale_bits > 0")
+        raise ValueError("MXINT quantization expects scale_bits > 0")
 
     from microxcaling.mx.elemwise_ops import _quantize_elemwise_core
     from microxcaling.mx.formats import _get_format_params
     from microxcaling.mx.mx_ops import _reshape_to_blocks, _shared_exponents, _undo_reshape_to_blocks
 
     tensor = tensor.contiguous()
-    ebits, mbits, emax, max_norm, _ = _get_format_params("int8")
+    ebits, mbits, emax, max_norm, _ = _get_format_params(elem_format)
 
     blocked, blocked_axes, orig_shape, padded_shape = _reshape_to_blocks(
         tensor,
@@ -144,7 +153,7 @@ def quantize_mxint8_channel_blocks(
     shared_exp = shared_exp - emax
     scale_emax = 2 ** (scale_bits - 1) - 1
     if torch.any(shared_exp > scale_emax):
-        raise ValueError("MXINT8 shared exponent overflow for configured scale_bits")
+        raise ValueError("MXINT shared exponent overflow for configured scale_bits")
     shared_exp = torch.clamp(shared_exp, min=-scale_emax)
 
     normalized = blocked / (2**shared_exp)
@@ -160,16 +169,44 @@ def quantize_mxint8_channel_blocks(
     )
 
     int_scale = 2 ** (mbits - 2)
-    raw_int = torch.clamp(torch.round(quantized_mx_float * int_scale), -127, 127).to(torch.int8)
+    raw_min = -(2 ** (mbits - 1) - 1)
+    raw_max = 2 ** (mbits - 1) - 1
+    raw_dtype = torch.int8 if elem_format == "int8" else torch.int16
+    raw_int = torch.clamp(torch.round(quantized_mx_float * int_scale), raw_min, raw_max).to(raw_dtype)
     raw_int = _undo_reshape_to_blocks(raw_int, padded_shape, orig_shape, blocked_axes).contiguous()
 
     shared_exp = shared_exp.squeeze(shared_exp_axes[0]).to(torch.int16).contiguous()
 
-    return MXInt8Tensor(
+    return MXIntTensor(
         elements=raw_int,
         scales=shared_exp,
         block_size=block_size,
         axis=axis,
+        elem_format=elem_format,
+        elem_mbits=mbits,
+    )
+
+
+def quantize_mxint8_channel_blocks(
+    tensor: torch.Tensor,
+    *,
+    axis: int,
+    block_size: int = 32,
+    scale_bits: int = 8,
+    round: str = "nearest",
+    shared_exp_method: str = "max",
+    flush_fp32_subnorms: bool = False,
+) -> MXIntTensor:
+    """Backward-compatible wrapper for MXINT8 quantization."""
+    return quantize_mxint_channel_blocks(
+        tensor,
+        axis=axis,
+        elem_format="int8",
+        block_size=block_size,
+        scale_bits=scale_bits,
+        round=round,
+        shared_exp_method=shared_exp_method,
+        flush_fp32_subnorms=flush_fp32_subnorms,
     )
 
 
@@ -199,6 +236,7 @@ if triton is not None:
         pad_w: tl.constexpr,
         has_bias: tl.constexpr,
         block_size: tl.constexpr,
+        elem_mbits: tl.constexpr,
         BLOCK_M: tl.constexpr,
     ):
         # Kernel step: dequantize each int8 product with its MX block exponents while accumulating.
@@ -241,12 +279,12 @@ if triton is not None:
                     w_elem = tl.load(w_q + w_offset, mask=spatial_mask, other=0).to(tl.float32)
                     x_exp = tl.load(x_s + x_scale_offset, mask=spatial_mask, other=0).to(tl.float32)
                     w_exp = tl.load(w_s + w_scale_offset, mask=spatial_mask, other=0).to(tl.float32)
-                    x_scale = tl.exp2(x_exp - 6.0)
-                    w_scale = tl.exp2(w_exp - 6.0)
+                    x_scale = tl.exp((x_exp - (elem_mbits - 2)) * 0.6931471805599453)
+                    w_scale = tl.exp((w_exp - (elem_mbits - 2)) * 0.6931471805599453)
 
                     # Core accumulator behavior:
-                    #   real_x ~= x_elem * exp2(x_shared_exp - 6)
-                    #   real_w ~= w_elem * exp2(w_shared_exp - 6)
+                    #   real_x ~= x_elem * exp2(x_shared_exp - (elem_mbits - 2))
+                    #   real_w ~= w_elem * exp2(w_shared_exp - (elem_mbits - 2))
                     #   acc += real_x * real_w
                     acc += x_elem * w_elem * x_scale * w_scale
 
@@ -257,15 +295,15 @@ if triton is not None:
 
 
 def mxint8_conv2d_triton(
-    x_mx: MXInt8Tensor,
-    w_mx: MXInt8Tensor,
+    x_mx: MXIntTensor,
+    w_mx: MXIntTensor,
     bias: torch.Tensor | None = None,
     *,
     stride: int | tuple[int, int] = 1,
     padding: int | tuple[int, int] = 0,
     block_m: int = 128,
 ) -> torch.Tensor:
-    """Run Conv2d on raw MXINT8 elements and scales with a Triton accumulator.
+    """Run Conv2d on raw MX integer elements and scales with a Triton accumulator.
 
     At this point activations and weights are already quantized. This function
     validates the MX tensors, computes the output shape, launches the Triton
@@ -290,8 +328,11 @@ def mxint8_conv2d_triton(
         raise ImportError("Triton is required for mxint8_conv2d_triton") from _TRITON_IMPORT_ERROR
     if x_mx.elements.device.type != "cuda" or w_mx.elements.device.type != "cuda":
         raise ValueError("MX Triton convolution expects CUDA tensors")
-    if x_mx.elements.dtype != torch.int8 or w_mx.elements.dtype != torch.int8:
-        raise ValueError("MX Triton convolution expects int8 element tensors")
+    if x_mx.elem_format != w_mx.elem_format or x_mx.elem_mbits != w_mx.elem_mbits:
+        raise ValueError("Activation and weight MX integer formats must match")
+    expected_dtype = torch.int8 if x_mx.elem_format == "int8" else torch.int16
+    if x_mx.elements.dtype != expected_dtype or w_mx.elements.dtype != expected_dtype:
+        raise ValueError(f"MX Triton convolution expects {x_mx.elem_format} element tensors")
     if x_mx.scales.dtype.is_floating_point or w_mx.scales.dtype.is_floating_point:
         raise ValueError("MX Triton convolution expects integer shared exponent tensors")
     if x_mx.block_size != w_mx.block_size:
@@ -337,6 +378,7 @@ def mxint8_conv2d_triton(
         pad_w,
         bias is not None,
         x_mx.block_size,
+        x_mx.elem_mbits,
         BLOCK_M=block_m,
     )
     return out

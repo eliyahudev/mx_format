@@ -13,7 +13,7 @@ from .mx_ops import quantize_mx_op
 from .elemwise_ops import quantize_elemwise_op
 from .specs import apply_mx_specs, get_backwards_mx_specs
 from .specs import mx_assert_test
-from mx_triton_conv2d import quantize_mxint8_channel_blocks, mxint8_conv2d_triton
+from mx_triton_conv2d import quantize_mxint_channel_blocks, mxint8_conv2d_triton
 
 f_conv1d = torch.nn.functional.conv1d
 f_conv2d = torch.nn.functional.conv2d
@@ -117,8 +117,11 @@ class ConvFunction(torch.autograd.Function):
     def _validate_int_ops_conv2d(input, weight, stride, padding, dilation, groups, mx_specs):
         if input.ndim != 4 or weight.ndim != 4:
             raise ValueError("INT_OPS convolution currently supports Conv2d only")
-        if mx_specs["a_elem_format"] != "int8" or mx_specs["w_elem_format"] != "int8":
-            raise ValueError("INT_OPS Conv2d currently supports only a_elem_format='int8' and w_elem_format='int8'")
+        supported_int_formats = ("int8", "int16")
+        if mx_specs["a_elem_format"] not in supported_int_formats or mx_specs["w_elem_format"] not in supported_int_formats:
+            raise ValueError("INT_OPS Conv2d currently supports only int8 or int16 element formats")
+        if mx_specs["a_elem_format"] != mx_specs["w_elem_format"]:
+            raise ValueError("INT_OPS Conv2d requires matching activation and weight integer formats")
         if mx_specs["shared_exp_method"] != "max":
             raise ValueError("INT_OPS Conv2d currently supports shared_exp_method='max'")
         if input.device.type != "cuda" or weight.device.type != "cuda":
@@ -191,18 +194,20 @@ class ConvFunction(torch.autograd.Function):
                 input, weight, stride, padding, dilation, groups, mx_specs
             )
 
-            x_mx = quantize_mxint8_channel_blocks(
+            x_mx = quantize_mxint_channel_blocks(
                 bf_in,
                 axis=1,
+                elem_format=mx_specs["a_elem_format"],
                 block_size=mx_specs["block_size"],
                 scale_bits=mx_specs["scale_bits"],
                 round=mx_specs["round_mx_output"],
                 shared_exp_method=mx_specs["shared_exp_method"],
                 flush_fp32_subnorms=mx_specs["mx_flush_fp32_subnorms"],
             )
-            w_mx = quantize_mxint8_channel_blocks(
+            w_mx = quantize_mxint_channel_blocks(
                 bf_weight,
                 axis=1,
+                elem_format=mx_specs["w_elem_format"],
                 block_size=mx_specs["block_size"],
                 scale_bits=mx_specs["scale_bits"],
                 round=mx_specs["round_mx_output"],

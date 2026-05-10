@@ -3,8 +3,8 @@ from microxcaling.mx.convolution import Conv2d
 
 mx_specs = {
     "scale_bits": 8,
-    "w_elem_format": "fp6_e3m2",
-    "a_elem_format": "fp6_e3m2",
+    "w_elem_format": "int8",
+    "a_elem_format": "int8",
     "block_size": 32,
     "bfloat": 16,
     "custom_cuda": False,

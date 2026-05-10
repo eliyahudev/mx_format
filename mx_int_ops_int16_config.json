@@ -1,0 +1,13 @@
+{
+  "default": {
+    "scale_bits": 8,
+    "w_elem_format": "int16",
+    "a_elem_format": "int16",
+    "block_size": 32,
+    "bfloat": 0,
+    "custom_cuda": false,
+    "quantize_backprop": false,
+    "int_ops": true
+  },
+  "layers": {}
+}

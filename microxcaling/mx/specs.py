@@ -123,7 +123,7 @@ class MxSpecs(collections.UserDict):
         self.help_strings = {
             "scale_bits": "Bits (sign + magnitude) to use for shared exponent/scale",
             "w_elem_format": "Weight MX elem format, one of {fp8_e5m2, fp8_e4m3, "
-                             "fp6_e3m2, fp6_e2m3, fp4_e2m1, int8, int4}",
+                             "fp6_e3m2, fp6_e2m3, fp4_e2m1, int16, int8, int4}",
             "a_elem_format": "Activation MX elem format. See w_elem_format",
             "w_elem_format_bp": "Backpass weight MX elem format. See w_elem_format",
             "a_elem_format_bp": "Backpass stashed activation MX elem format. See w_elem_format",
