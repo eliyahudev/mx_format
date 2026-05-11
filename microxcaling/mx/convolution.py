@@ -135,7 +135,7 @@ class ConvFunction(torch.autograd.Function):
             raise ValueError("INT_OPS Conv2d requires mx_specs['block_size'] > 0")
         if mx_specs["acc_bits"] <= 0:
             raise ValueError("INT_OPS Conv2d requires mx_specs['acc_bits'] > 0")
-        input_channels = input.shape[3] if input_layout == "nhwc" else input.shape[1]
+        input_channels = input.shape[1]
         if input_channels != weight.shape[1]:
             raise ValueError(f"Input channels ({input_channels}) must match weight channels ({weight.shape[1]})")
 
@@ -199,6 +199,7 @@ class ConvFunction(torch.autograd.Function):
             )
             input_layout = mx_specs["conv2d_input_layout"]
             input_channel_axis = 3 if input_layout == "nhwc" else 1
+            bf_in_for_int_ops = bf_in.permute(0, 2, 3, 1).contiguous() if input_layout == "nhwc" else bf_in
 
             if mx_specs["quantize_backprop"]:
                 ctx.save_for_backward(bf_in, bf_weight)
@@ -206,7 +207,7 @@ class ConvFunction(torch.autograd.Function):
                 ctx.save_for_backward(input, weight)
 
             x_mx = quantize_mxint_channel_blocks(
-                bf_in,
+                bf_in_for_int_ops,
                 axis=input_channel_axis,
                 elem_format=mx_specs["a_elem_format"],
                 block_size=mx_specs["block_size"],
@@ -286,10 +287,6 @@ class ConvFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         # load context
         input, weight = ctx.saved_tensors
-        input_layout = getattr(ctx, "conv2d_input_layout", "nchw")
-
-        if input_layout == "nhwc":
-            input = input.permute(0, 3, 1, 2).contiguous()
 
         assert grad_output.shape[1] % ctx.groups == 0
 
@@ -374,8 +371,6 @@ class ConvFunction(torch.autograd.Function):
             mx_specs=ctx.mx_specs,
             round=ctx.mx_specs["round_grad_input"],
         )
-        if input_layout == "nhwc":
-            grad_input = grad_input.permute(0, 2, 3, 1).contiguous()
 
         #####################################################
         # Compute grad_bias

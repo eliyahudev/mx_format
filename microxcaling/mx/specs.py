@@ -166,7 +166,7 @@ class MxSpecs(collections.UserDict):
             "custom_cuda": "Enable custom CUDA kernels for quantization",
             "int_ops": "Use forward-only raw integer Conv2d ops where supported",
             "acc_bits": "Signed accumulator bit width for INT_OPS device overflow assertions",
-            "conv2d_input_layout": "Activation layout for INT_OPS Conv2d. Options: nchw, nhwc",
+            "conv2d_input_layout": "Internal activation layout for INT_OPS Conv2d. Public inputs remain NCHW. Options: nchw, nhwc",
         }
 
         for k in defaults:

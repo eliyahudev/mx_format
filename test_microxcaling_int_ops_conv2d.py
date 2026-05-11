@@ -94,7 +94,7 @@ class IntOpsConv2dTest(unittest.TestCase):
         specs = dict(INT_OPS_SPECS)
         specs["conv2d_input_layout"] = "nhwc"
         conv = Conv2d(32, 8, kernel_size=3, padding=1, mx_specs=specs).cuda()
-        x = torch.randn(2, 16, 16, 32, device="cuda", requires_grad=True)
+        x = torch.randn(2, 32, 16, 16, device="cuda", requires_grad=True)
 
         self._assert_nhwc_backward_grads(conv, x)
 

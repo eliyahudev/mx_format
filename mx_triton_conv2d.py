@@ -96,7 +96,7 @@ def quantize_mxint_channel_blocks(
     For NCHW activations use axis=1, producing scales of shape
     [N, ceil(C / block_size), H, W].
 
-    For NHWC activations use axis=3, producing scales of shape
+    For internally-transposed NHWC activations use axis=3, producing scales of shape
     [N, H, W, ceil(C / block_size)].
 
     For OIHW weights use axis=1, producing scales of shape
@@ -338,7 +338,9 @@ def mxint8_conv2d_triton(
     activation or weight tensors before computing.
 
     Args:
-        x_mx: Quantized NCHW or NHWC activation tensor.
+        x_mx: Quantized activation tensor. Public Conv2d inputs are NCHW;
+            `input_layout="nhwc"` expects this tensor to have been internally
+            transposed to NHWC before quantization.
         w_mx: Quantized OIHW weight tensor.
         bias: Optional float bias with one value per output channel.
         stride: Conv2d stride as an int or `(height, width)` tuple.
