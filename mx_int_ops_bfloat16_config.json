@@ -7,7 +7,8 @@
     "bfloat": 16,
     "custom_cuda": false,
     "quantize_backprop": false,
-    "int_ops": true
+    "int_ops": true,
+    "acc_bits": 32
   },
   "layers": {}
 }

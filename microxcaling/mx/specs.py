@@ -118,6 +118,7 @@ class MxSpecs(collections.UserDict):
 
             "custom_cuda": False,
             "int_ops": False,
+            "acc_bits": 32,
         }
 
         self.help_strings = {
@@ -163,6 +164,7 @@ class MxSpecs(collections.UserDict):
 
             "custom_cuda": "Enable custom CUDA kernels for quantization",
             "int_ops": "Use forward-only raw integer Conv2d ops where supported",
+            "acc_bits": "Signed accumulator bit width for INT_OPS device overflow assertions",
         }
 
         for k in defaults:

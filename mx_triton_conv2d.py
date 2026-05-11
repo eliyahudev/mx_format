@@ -238,6 +238,7 @@ if triton is not None:
         block_size: tl.constexpr,
         x_elem_mbits: tl.constexpr,
         w_elem_mbits: tl.constexpr,
+        ACC_BITS: tl.constexpr,
         BLOCK_M: tl.constexpr,
     ):
         # Kernel step: dequantize each integer product with its MX block exponents while accumulating.
@@ -255,6 +256,8 @@ if triton is not None:
         n_idx = tmp // oc
 
         acc = tl.zeros((BLOCK_M,), tl.float32)
+        acc_min = -(2 ** (ACC_BITS - 1))
+        acc_max = (2 ** (ACC_BITS - 1)) - 1
 
         # Walk over the convolution window and input channels. Padding is
         # handled with masks so invalid input positions contribute zero.
@@ -287,7 +290,17 @@ if triton is not None:
                     #   real_x ~= x_elem * exp2(x_shared_exp - (x_elem_mbits - 2))
                     #   real_w ~= w_elem * exp2(w_shared_exp - (w_elem_mbits - 2))
                     #   acc += real_x * real_w
-                    acc += x_elem * w_elem * x_scale * w_scale
+                    acc_man = x_elem * w_elem
+                    tl.device_assert(
+                        (~spatial_mask) | ((acc_man >= acc_min) & (acc_man <= acc_max)),
+                        "MXINT Conv2d product accumulator overflow",
+                    )
+                    acc_next = acc + acc_man * x_scale * w_scale
+                    tl.device_assert(
+                        (~spatial_mask) | ((acc_next >= acc_min) & (acc_next <= acc_max)),
+                        "MXINT Conv2d running accumulator overflow",
+                    )
+                    acc = acc_next
 
         if has_bias:
             acc += tl.load(bias + oc_idx, mask=mask, other=0.0)
@@ -302,6 +315,7 @@ def mxint8_conv2d_triton(
     *,
     stride: int | tuple[int, int] = 1,
     padding: int | tuple[int, int] = 0,
+    acc_bits: int = 32,
     block_m: int = 128,
 ) -> torch.Tensor:
     """Run Conv2d on raw MX integer elements and scales with a Triton accumulator.
@@ -320,6 +334,7 @@ def mxint8_conv2d_triton(
         bias: Optional float bias with one value per output channel.
         stride: Conv2d stride as an int or `(height, width)` tuple.
         padding: Conv2d zero padding as an int or `(height, width)` tuple.
+        acc_bits: Signed accumulator bit width checked by Triton device asserts.
         block_m: Number of output elements computed by one Triton program.
 
     Returns:
@@ -341,6 +356,8 @@ def mxint8_conv2d_triton(
         raise ValueError("Activation and weight block sizes must match")
     if x_mx.axis != 1 or w_mx.axis != 1:
         raise ValueError("This example expects MX blocks along channel axis 1")
+    if acc_bits <= 0:
+        raise ValueError("MX Triton convolution expects acc_bits > 0")
 
     stride_h, stride_w = _pair(stride)
     pad_h, pad_w = _pair(padding)
@@ -382,6 +399,7 @@ def mxint8_conv2d_triton(
         x_mx.block_size,
         x_mx.elem_mbits,
         w_mx.elem_mbits,
+        ACC_BITS=acc_bits,
         BLOCK_M=block_m,
     )
     return out

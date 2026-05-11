@@ -130,6 +130,8 @@ class ConvFunction(torch.autograd.Function):
             raise ValueError("INT_OPS Conv2d currently supports dilation == 1")
         if mx_specs["block_size"] <= 0:
             raise ValueError("INT_OPS Conv2d requires mx_specs['block_size'] > 0")
+        if mx_specs["acc_bits"] <= 0:
+            raise ValueError("INT_OPS Conv2d requires mx_specs['acc_bits'] > 0")
 
     @staticmethod
     def forward(
@@ -223,6 +225,7 @@ class ConvFunction(torch.autograd.Function):
                 bf_bias,
                 stride=stride,
                 padding=padding,
+                acc_bits=mx_specs["acc_bits"],
             )
             output = quantize_elemwise_op(
                 output, mx_specs=mx_specs, round=mx_specs["round_output"]

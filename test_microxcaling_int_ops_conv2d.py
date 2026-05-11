@@ -18,6 +18,7 @@ INT_OPS_SPECS = {
     "custom_cuda": False,
     "quantize_backprop": False,
     "int_ops": True,
+    "acc_bits": 32,
 }
 
 INT16_OPS_SPECS = dict(INT_OPS_SPECS)
