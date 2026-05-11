@@ -119,6 +119,7 @@ class MxSpecs(collections.UserDict):
             "custom_cuda": False,
             "int_ops": False,
             "acc_bits": 32,
+            "conv2d_input_layout": "nchw",
         }
 
         self.help_strings = {
@@ -165,6 +166,7 @@ class MxSpecs(collections.UserDict):
             "custom_cuda": "Enable custom CUDA kernels for quantization",
             "int_ops": "Use forward-only raw integer Conv2d ops where supported",
             "acc_bits": "Signed accumulator bit width for INT_OPS device overflow assertions",
+            "conv2d_input_layout": "Activation layout for INT_OPS Conv2d. Options: nchw, nhwc",
         }
 
         for k in defaults:
@@ -231,6 +233,9 @@ def apply_mx_specs(mx_specs, default_mx_specs=None):
             if k not in default_mx_specs:
                 raise KeyError(f"Unknown key '{k}' passed to mx specs")
             default_mx_specs[k] = mx_specs[k]
+
+    if default_mx_specs["conv2d_input_layout"] not in ("nchw", "nhwc"):
+        raise ValueError("mx_specs['conv2d_input_layout'] must be 'nchw' or 'nhwc'")
 
     return default_mx_specs
 

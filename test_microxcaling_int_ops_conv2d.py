@@ -3,10 +3,12 @@ import unittest
 try:
     import torch
     from microxcaling.mx.convolution import Conv1d, Conv2d
+    from microxcaling.mx.specs import apply_mx_specs
 except ModuleNotFoundError:
     torch = None
     Conv1d = None
     Conv2d = None
+    apply_mx_specs = None
 
 
 INT_OPS_SPECS = {
@@ -49,6 +51,21 @@ class IntOpsConv2dTest(unittest.TestCase):
         self.assertIsNotNone(conv.bias.grad)
         self.assertEqual(tuple(conv.bias.grad.shape), tuple(conv.bias.shape))
 
+    def _assert_nhwc_backward_grads(self, conv, x):
+        y = conv(x)
+
+        self.assertEqual(tuple(y.shape), (2, 8, 16, 16))
+        self.assertEqual(y.dtype, torch.float32)
+
+        y.sum().backward()
+
+        self.assertIsNotNone(x.grad)
+        self.assertEqual(tuple(x.grad.shape), tuple(x.shape))
+        self.assertIsNotNone(conv.weight.grad)
+        self.assertEqual(tuple(conv.weight.grad.shape), tuple(conv.weight.shape))
+        self.assertIsNotNone(conv.bias.grad)
+        self.assertEqual(tuple(conv.bias.grad.shape), tuple(conv.bias.shape))
+
     @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA is required")
     def test_int_ops_conv2d_forward_and_backward(self):
         conv = Conv2d(32, 8, kernel_size=3, padding=1, mx_specs=INT_OPS_SPECS).cuda()
@@ -71,6 +88,20 @@ class IntOpsConv2dTest(unittest.TestCase):
         x = torch.randn(2, 32, 16, 16, device="cuda", requires_grad=True)
 
         self._assert_backward_grads(conv, x)
+
+    @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA is required")
+    def test_int_ops_nhwc_conv2d_forward_and_backward(self):
+        specs = dict(INT_OPS_SPECS)
+        specs["conv2d_input_layout"] = "nhwc"
+        conv = Conv2d(32, 8, kernel_size=3, padding=1, mx_specs=specs).cuda()
+        x = torch.randn(2, 16, 16, 32, device="cuda", requires_grad=True)
+
+        self._assert_nhwc_backward_grads(conv, x)
+
+    def test_int_ops_accepts_conv2d_input_layout_spec(self):
+        specs = apply_mx_specs({"conv2d_input_layout": "nhwc"})
+
+        self.assertEqual(specs["conv2d_input_layout"], "nhwc")
 
     @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA is required")
     def test_int_ops_rejects_unsupported_conv1d(self):
@@ -118,6 +149,13 @@ class IntOpsConv2dTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "shared_exp_method='max'"):
             conv(x)
+
+    def test_int_ops_rejects_invalid_conv2d_input_layout(self):
+        specs = dict(INT_OPS_SPECS)
+        specs["conv2d_input_layout"] = "hwcn"
+
+        with self.assertRaisesRegex(ValueError, "conv2d_input_layout"):
+            Conv2d(32, 8, kernel_size=3, padding=1, mx_specs=specs)
 
     @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA is required")
     def test_int_ops_rejects_groups_and_dilation(self):

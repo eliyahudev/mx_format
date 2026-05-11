@@ -117,6 +117,9 @@ class ConvFunction(torch.autograd.Function):
     def _validate_int_ops_conv2d(input, weight, stride, padding, dilation, groups, mx_specs):
         if input.ndim != 4 or weight.ndim != 4:
             raise ValueError("INT_OPS convolution currently supports Conv2d only")
+        input_layout = mx_specs["conv2d_input_layout"]
+        if input_layout not in ("nchw", "nhwc"):
+            raise ValueError("INT_OPS Conv2d mx_specs['conv2d_input_layout'] must be 'nchw' or 'nhwc'")
         supported_int_formats = ("int8", "int16")
         if mx_specs["a_elem_format"] not in supported_int_formats or mx_specs["w_elem_format"] not in supported_int_formats:
             raise ValueError("INT_OPS Conv2d currently supports only int8 or int16 element formats")
@@ -132,6 +135,9 @@ class ConvFunction(torch.autograd.Function):
             raise ValueError("INT_OPS Conv2d requires mx_specs['block_size'] > 0")
         if mx_specs["acc_bits"] <= 0:
             raise ValueError("INT_OPS Conv2d requires mx_specs['acc_bits'] > 0")
+        input_channels = input.shape[3] if input_layout == "nhwc" else input.shape[1]
+        if input_channels != weight.shape[1]:
+            raise ValueError(f"Input channels ({input_channels}) must match weight channels ({weight.shape[1]})")
 
     @staticmethod
     def forward(
@@ -187,12 +193,12 @@ class ConvFunction(torch.autograd.Function):
         else:
             bf_bias = None
 
-        assert input.shape[1] % groups == 0
-
         if mx_specs.get("int_ops", False):
             ConvFunction._validate_int_ops_conv2d(
                 input, weight, stride, padding, dilation, groups, mx_specs
             )
+            input_layout = mx_specs["conv2d_input_layout"]
+            input_channel_axis = 3 if input_layout == "nhwc" else 1
 
             if mx_specs["quantize_backprop"]:
                 ctx.save_for_backward(bf_in, bf_weight)
@@ -201,7 +207,7 @@ class ConvFunction(torch.autograd.Function):
 
             x_mx = quantize_mxint_channel_blocks(
                 bf_in,
-                axis=1,
+                axis=input_channel_axis,
                 elem_format=mx_specs["a_elem_format"],
                 block_size=mx_specs["block_size"],
                 scale_bits=mx_specs["scale_bits"],
@@ -226,13 +232,17 @@ class ConvFunction(torch.autograd.Function):
                 stride=stride,
                 padding=padding,
                 acc_bits=mx_specs["acc_bits"],
+                input_layout=input_layout,
             )
             output = quantize_elemwise_op(
                 output, mx_specs=mx_specs, round=mx_specs["round_output"]
             )
             ctx.int_ops_forward_only = True
             ctx.mx_specs = get_backwards_mx_specs(mx_specs)
+            ctx.conv2d_input_layout = input_layout
             return output
+
+        assert input.shape[1] % groups == 0
 
         # save context after quantize
         if mx_specs["quantize_backprop"]:
@@ -274,10 +284,14 @@ class ConvFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        assert grad_output.shape[1] % ctx.groups == 0
-
         # load context
         input, weight = ctx.saved_tensors
+        input_layout = getattr(ctx, "conv2d_input_layout", "nchw")
+
+        if input_layout == "nhwc":
+            input = input.permute(0, 3, 1, 2).contiguous()
+
+        assert grad_output.shape[1] % ctx.groups == 0
 
         grad_output = quantize_elemwise_op(
             grad_output,
@@ -360,6 +374,8 @@ class ConvFunction(torch.autograd.Function):
             mx_specs=ctx.mx_specs,
             round=ctx.mx_specs["round_grad_input"],
         )
+        if input_layout == "nhwc":
+            grad_input = grad_input.permute(0, 2, 3, 1).contiguous()
 
         #####################################################
         # Compute grad_bias

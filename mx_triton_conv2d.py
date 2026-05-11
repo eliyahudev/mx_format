@@ -8,7 +8,7 @@ The implemented formats are MXINT8/MXINT16-style:
     real_value ~= int_element * 2 ** (shared_exp - (element_bits - 2))
 
 Supported convolution shape for this example:
-    - NCHW activations
+    - NCHW or NHWC activations
     - OIHW weights
     - groups == 1
     - dilation == 1
@@ -96,12 +96,15 @@ def quantize_mxint_channel_blocks(
     For NCHW activations use axis=1, producing scales of shape
     [N, ceil(C / block_size), H, W].
 
+    For NHWC activations use axis=3, producing scales of shape
+    [N, H, W, ceil(C / block_size)].
+
     For OIHW weights use axis=1, producing scales of shape
     [O, ceil(I / block_size), H, W].
 
     Args:
         tensor: CUDA activation or weight tensor to quantize.
-        axis: Channel axis to block. This example currently supports axis 1.
+        axis: Channel axis to block.
         elem_format: Integer MX element format. Supported: "int8" or "int16".
         block_size: Number of channels sharing one scale.
         scale_bits: Number of bits used by the shared MX exponent.
@@ -116,8 +119,8 @@ def quantize_mxint_channel_blocks(
         raise ValueError("MX Triton quantization expects a CUDA tensor")
     if axis < 0:
         axis += tensor.ndim
-    if axis != 1:
-        raise ValueError("This conv example currently supports channel axis=1")
+    if axis < 0 or axis >= tensor.ndim:
+        raise ValueError("MXINT quantization axis is out of range")
     if elem_format not in ("int8", "int16"):
         raise ValueError("MX Triton quantization currently supports elem_format 'int8' or 'int16'")
     if block_size <= 0:
@@ -238,6 +241,7 @@ if triton is not None:
         block_size: tl.constexpr,
         x_elem_mbits: tl.constexpr,
         w_elem_mbits: tl.constexpr,
+        INPUT_IS_NHWC: tl.constexpr,
         ACC_BITS: tl.constexpr,
         BLOCK_M: tl.constexpr,
     ):
@@ -273,10 +277,14 @@ if triton is not None:
                 for ci in range(0, c):
                     cb = ci // block_size
 
-                    x_offset = ((n_idx * c + ci) * h + ih_idx) * width + iw_idx
+                    if INPUT_IS_NHWC:
+                        x_offset = ((n_idx * h + ih_idx) * width + iw_idx) * c + ci
+                        x_scale_offset = ((n_idx * h + ih_idx) * width + iw_idx) * tl.cdiv(c, block_size) + cb
+                    else:
+                        x_offset = ((n_idx * c + ci) * h + ih_idx) * width + iw_idx
+                        x_scale_offset = ((n_idx * tl.cdiv(c, block_size) + cb) * h + ih_idx) * width + iw_idx
                     w_offset = ((oc_idx * c + ci) * kh + r) * kw + s
 
-                    x_scale_offset = ((n_idx * tl.cdiv(c, block_size) + cb) * h + ih_idx) * width + iw_idx
                     w_scale_offset = ((oc_idx * tl.cdiv(c, block_size) + cb) * kh + r) * kw + s
 
                     x_elem = tl.load(x_q + x_offset, mask=spatial_mask, other=0).to(tl.float32)
@@ -317,6 +325,7 @@ def mxint8_conv2d_triton(
     padding: int | tuple[int, int] = 0,
     acc_bits: int = 32,
     block_m: int = 128,
+    input_layout: str = "nchw",
 ) -> torch.Tensor:
     """Run Conv2d on raw MX integer elements and scales with a Triton accumulator.
 
@@ -329,13 +338,14 @@ def mxint8_conv2d_triton(
     activation or weight tensors before computing.
 
     Args:
-        x_mx: Quantized NCHW activation tensor.
+        x_mx: Quantized NCHW or NHWC activation tensor.
         w_mx: Quantized OIHW weight tensor.
         bias: Optional float bias with one value per output channel.
         stride: Conv2d stride as an int or `(height, width)` tuple.
         padding: Conv2d zero padding as an int or `(height, width)` tuple.
         acc_bits: Signed accumulator bit width checked by Triton device asserts.
         block_m: Number of output elements computed by one Triton program.
+        input_layout: Activation layout, either `"nchw"` or `"nhwc"`.
 
     Returns:
         Float32 convolution output with shape `[N, out_channels, out_h, out_w]`.
@@ -354,15 +364,22 @@ def mxint8_conv2d_triton(
         raise ValueError("MX Triton convolution expects integer shared exponent tensors")
     if x_mx.block_size != w_mx.block_size:
         raise ValueError("Activation and weight block sizes must match")
-    if x_mx.axis != 1 or w_mx.axis != 1:
-        raise ValueError("This example expects MX blocks along channel axis 1")
+    if input_layout not in ("nchw", "nhwc"):
+        raise ValueError("MX Triton convolution input_layout must be 'nchw' or 'nhwc'")
+    input_is_nhwc = input_layout == "nhwc"
+    expected_x_axis = 3 if input_is_nhwc else 1
+    if x_mx.axis != expected_x_axis or w_mx.axis != 1:
+        raise ValueError("MX Triton convolution received tensors quantized along the wrong channel axis")
     if acc_bits <= 0:
         raise ValueError("MX Triton convolution expects acc_bits > 0")
 
     stride_h, stride_w = _pair(stride)
     pad_h, pad_w = _pair(padding)
 
-    n, c, h, width = x_mx.elements.shape
+    if input_is_nhwc:
+        n, h, width, c = x_mx.elements.shape
+    else:
+        n, c, h, width = x_mx.elements.shape
     oc, weight_c, kh, kw = w_mx.elements.shape
     if c != weight_c:
         raise ValueError(f"Input channels ({c}) must match weight channels ({weight_c})")
@@ -399,6 +416,7 @@ def mxint8_conv2d_triton(
         x_mx.block_size,
         x_mx.elem_mbits,
         w_mx.elem_mbits,
+        INPUT_IS_NHWC=input_is_nhwc,
         ACC_BITS=acc_bits,
         BLOCK_M=block_m,
     )

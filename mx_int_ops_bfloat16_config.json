@@ -8,7 +8,8 @@
     "custom_cuda": false,
     "quantize_backprop": false,
     "int_ops": true,
-    "acc_bits": 32
+    "acc_bits": 32,
+    "conv2d_input_layout": "nhwc"
   },
   "layers": {}
 }
