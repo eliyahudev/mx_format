@@ -54,8 +54,10 @@ def _shared_exponents(A, method="max", axes=None, ebits=0):
       method {str}            -- Exponent selection method.
                                  "max" uses the max absolute value
                                  "none" uses an exponent for each value (i.e., no sharing)
-      axes   {list(int)}      -- List of integers which specifies the axes across which
-                                 shared exponents are calculated.
+      axes   {list(int)}      -- List of physical tensor axes across which
+                                 shared exponents are calculated. For blocked
+                                 MX, pass the group axis; after reshaping the
+                                 reduction happens over the inserted block dim.
     Returns:
       shared_exp {PyTorch tensor} -- Tensor of shared exponents
     """

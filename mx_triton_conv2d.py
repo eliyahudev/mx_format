@@ -39,7 +39,7 @@ else:
 
 @dataclass(frozen=True)
 class MXIntTensor:
-    """Raw MXINT-style tensor: integer elements plus per-channel-block exponents.
+    """Raw MXINT-style tensor: integer elements plus grouped exponents.
 
     `elements` is the low-precision integer tensor. `scales` keeps its name for
     compatibility, but stores integer shared exponents. A real value is
@@ -93,20 +93,20 @@ def quantize_mxint_channel_blocks(
 
         acc += x_elem * w_elem * exp2(x_exp - offset) * exp2(w_exp - offset)
 
-    For NCHW activations use axis=1, producing scales of shape
-    [N, ceil(C / block_size), H, W].
+    For physical-last grouping of NCHW activations use axis=-1, producing
+    scales of shape [N, C, H, ceil(W / block_size)].
 
-    For internally-transposed NHWC activations use axis=3, producing scales of shape
-    [N, H, W, ceil(C / block_size)].
+    For physical-last grouping of internally-transposed NHWC activations use
+    axis=-1, producing scales of shape [N, H, W, ceil(C / block_size)].
 
-    For OIHW weights use axis=1, producing scales of shape
-    [O, ceil(I / block_size), H, W].
+    For physical-last grouping of OIHW weights use axis=-1, producing scales
+    of shape [O, I, H, ceil(W / block_size)].
 
     Args:
         tensor: CUDA activation or weight tensor to quantize.
-        axis: Channel axis to block.
+        axis: Physical tensor axis to block.
         elem_format: Integer MX element format. Supported: "int8" or "int16".
-        block_size: Number of channels sharing one scale.
+        block_size: Number of values sharing one scale along `axis`.
         scale_bits: Number of bits used by the shared MX exponent.
         round: Rounding mode passed to microxcaling's elementwise core.
         shared_exp_method: Shared exponent method; currently expected to be "max".
@@ -213,6 +213,50 @@ def quantize_mxint8_channel_blocks(
     )
 
 
+def quantize_mxint_last_axis_blocks(
+    tensor: torch.Tensor,
+    *,
+    elem_format: str = "int8",
+    block_size: int = 32,
+    scale_bits: int = 8,
+    round: str = "nearest",
+    shared_exp_method: str = "max",
+    flush_fp32_subnorms: bool = False,
+) -> MXIntTensor:
+    """Quantize raw MXINT blocks over the tensor's physical last axis."""
+    return quantize_mxint_channel_blocks(
+        tensor,
+        axis=-1,
+        elem_format=elem_format,
+        block_size=block_size,
+        scale_bits=scale_bits,
+        round=round,
+        shared_exp_method=shared_exp_method,
+        flush_fp32_subnorms=flush_fp32_subnorms,
+    )
+
+
+def quantize_mxint8_last_axis_blocks(
+    tensor: torch.Tensor,
+    *,
+    block_size: int = 32,
+    scale_bits: int = 8,
+    round: str = "nearest",
+    shared_exp_method: str = "max",
+    flush_fp32_subnorms: bool = False,
+) -> MXIntTensor:
+    """Quantize raw MXINT8 blocks over the tensor's physical last axis."""
+    return quantize_mxint_last_axis_blocks(
+        tensor,
+        elem_format="int8",
+        block_size=block_size,
+        scale_bits=scale_bits,
+        round=round,
+        shared_exp_method=shared_exp_method,
+        flush_fp32_subnorms=flush_fp32_subnorms,
+    )
+
+
 if triton is not None:
 
     @triton.jit
@@ -275,17 +319,18 @@ if triton is not None:
                 spatial_mask = mask & valid_h & valid_w
 
                 for ci in range(0, c):
-                    cb = ci // block_size
+                    c_block = ci // block_size
+                    w_block = s // block_size
 
                     if INPUT_IS_NHWC:
                         x_offset = ((n_idx * h + ih_idx) * width + iw_idx) * c + ci
-                        x_scale_offset = ((n_idx * h + ih_idx) * width + iw_idx) * tl.cdiv(c, block_size) + cb
+                        x_scale_offset = ((n_idx * h + ih_idx) * width + iw_idx) * tl.cdiv(c, block_size) + c_block
                     else:
                         x_offset = ((n_idx * c + ci) * h + ih_idx) * width + iw_idx
-                        x_scale_offset = ((n_idx * tl.cdiv(c, block_size) + cb) * h + ih_idx) * width + iw_idx
+                        x_scale_offset = ((n_idx * c + ci) * h + ih_idx) * tl.cdiv(width, block_size) + (iw_idx // block_size)
                     w_offset = ((oc_idx * c + ci) * kh + r) * kw + s
 
-                    w_scale_offset = ((oc_idx * tl.cdiv(c, block_size) + cb) * kh + r) * kw + s
+                    w_scale_offset = ((oc_idx * c + ci) * kh + r) * tl.cdiv(kw, block_size) + w_block
 
                     x_elem = tl.load(x_q + x_offset, mask=spatial_mask, other=0).to(tl.float32)
                     w_elem = tl.load(w_q + w_offset, mask=spatial_mask, other=0).to(tl.float32)
@@ -340,7 +385,8 @@ def mxint8_conv2d_triton(
     Args:
         x_mx: Quantized activation tensor. Public Conv2d inputs are NCHW;
             `input_layout="nhwc"` expects this tensor to have been internally
-            transposed to NHWC before quantization.
+            transposed to NHWC before quantization. Activations and weights
+            must be grouped over their physical last dimension.
         w_mx: Quantized OIHW weight tensor.
         bias: Optional float bias with one value per output channel.
         stride: Conv2d stride as an int or `(height, width)` tuple.
@@ -369,9 +415,8 @@ def mxint8_conv2d_triton(
     if input_layout not in ("nchw", "nhwc"):
         raise ValueError("MX Triton convolution input_layout must be 'nchw' or 'nhwc'")
     input_is_nhwc = input_layout == "nhwc"
-    expected_x_axis = 3 if input_is_nhwc else 1
-    if x_mx.axis != expected_x_axis or w_mx.axis != 1:
-        raise ValueError("MX Triton convolution received tensors quantized along the wrong channel axis")
+    if x_mx.axis != x_mx.elements.ndim - 1 or w_mx.axis != w_mx.elements.ndim - 1:
+        raise ValueError("MX Triton convolution expects tensors quantized along the physical last axis")
     if acc_bits <= 0:
         raise ValueError("MX Triton convolution expects acc_bits > 0")
 
@@ -515,9 +560,9 @@ class MXInt8TritonConv2d(nn.Module):
         activation and weight tensors remain raw int8+scale pairs.
         """
         # Step 1: quantize the current activation tensor into int8 blocks.
-        x_mx = quantize_mxint8_channel_blocks(x, axis=1, block_size=self.block_size)
+        x_mx = quantize_mxint8_last_axis_blocks(x, block_size=self.block_size)
         # Step 2: quantize this layer's floating-point weights the same way.
-        w_mx = quantize_mxint8_channel_blocks(self.weight, axis=1, block_size=self.block_size)
+        w_mx = quantize_mxint8_last_axis_blocks(self.weight, block_size=self.block_size)
         # Step 3: call the Triton convolution that applies scales during accumulation.
         return mxint8_conv2d_triton(
             x_mx,
@@ -543,7 +588,7 @@ def replace_conv2d_with_mxint8_triton(
 
     Args:
         model: Any PyTorch module tree.
-        block_size: Number of channels sharing one MX scale.
+        block_size: Number of values sharing one MX scale along the last axis.
         inplace: If true, mutate `model`; otherwise convert a deep copy.
 
     Returns:
@@ -579,8 +624,8 @@ def example_usage() -> None:
     weight = torch.randn(8, 32, 3, 3, device="cuda")
     bias = torch.randn(8, device="cuda")
 
-    x_mx = quantize_mxint8_channel_blocks(x, axis=1, block_size=32)
-    w_mx = quantize_mxint8_channel_blocks(weight, axis=1, block_size=32)
+    x_mx = quantize_mxint8_last_axis_blocks(x, block_size=32)
+    w_mx = quantize_mxint8_last_axis_blocks(weight, block_size=32)
 
     y_mx = mxint8_conv2d_triton(x_mx, w_mx, bias, stride=1, padding=1)
     y_ref = F.conv2d(x, weight, bias, stride=1, padding=1)

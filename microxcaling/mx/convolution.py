@@ -13,7 +13,7 @@ from .mx_ops import quantize_mx_op
 from .elemwise_ops import quantize_elemwise_op
 from .specs import apply_mx_specs, get_backwards_mx_specs
 from .specs import mx_assert_test
-from mx_triton_conv2d import quantize_mxint_channel_blocks, mxint8_conv2d_triton
+from mx_triton_conv2d import quantize_mxint_last_axis_blocks, mxint8_conv2d_triton
 
 f_conv1d = torch.nn.functional.conv1d
 f_conv2d = torch.nn.functional.conv2d
@@ -198,7 +198,6 @@ class ConvFunction(torch.autograd.Function):
                 input, weight, stride, padding, dilation, groups, mx_specs
             )
             input_layout = mx_specs["conv2d_input_layout"]
-            input_channel_axis = 3 if input_layout == "nhwc" else 1
             bf_in_for_int_ops = bf_in.permute(0, 2, 3, 1).contiguous() if input_layout == "nhwc" else bf_in
 
             if mx_specs["quantize_backprop"]:
@@ -206,9 +205,8 @@ class ConvFunction(torch.autograd.Function):
             else:
                 ctx.save_for_backward(input, weight)
 
-            x_mx = quantize_mxint_channel_blocks(
+            x_mx = quantize_mxint_last_axis_blocks(
                 bf_in_for_int_ops,
-                axis=input_channel_axis,
                 elem_format=mx_specs["a_elem_format"],
                 block_size=mx_specs["block_size"],
                 scale_bits=mx_specs["scale_bits"],
@@ -216,9 +214,8 @@ class ConvFunction(torch.autograd.Function):
                 shared_exp_method=mx_specs["shared_exp_method"],
                 flush_fp32_subnorms=mx_specs["mx_flush_fp32_subnorms"],
             )
-            w_mx = quantize_mxint_channel_blocks(
+            w_mx = quantize_mxint_last_axis_blocks(
                 bf_weight,
-                axis=1,
                 elem_format=mx_specs["w_elem_format"],
                 block_size=mx_specs["block_size"],
                 scale_bits=mx_specs["scale_bits"],
