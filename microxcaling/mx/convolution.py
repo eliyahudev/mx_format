@@ -9,7 +9,7 @@ import packaging.version as version
 from torch.nn import grad
 from torch.nn.modules.utils import _single, _pair, _triple
 
-from .mx_ops import quantize_mx_op
+from .mx_ops import _physical_last_axis, quantize_mx_op
 from .elemwise_ops import quantize_elemwise_op
 from .specs import apply_mx_specs, get_backwards_mx_specs
 from .specs import mx_assert_test
@@ -253,18 +253,19 @@ class ConvFunction(torch.autograd.Function):
         #####################################################
         #   input is (batch, in_channels, ...)
         #   weight is (out_channels, in_channels/groups, ..)
-        # quantize along in_channels
+        # quantize over the physical last dimension so layout changes affect
+        # which values share an MX exponent.
         qid_input = quantize_mx_op(
             bf_in,
             mx_specs,
             elem_format=mx_specs['a_elem_format'],
-            axes=[1],
+            axes=[_physical_last_axis(bf_in)],
         )
         qid_weight = quantize_mx_op(
             bf_weight,
             mx_specs,
             elem_format=mx_specs['w_elem_format'],
-            axes=[1],
+            axes=[_physical_last_axis(bf_weight)],
         )
 
         # compute output
@@ -298,18 +299,18 @@ class ConvFunction(torch.autograd.Function):
         #####################################################
         #   input is  (batch, in_channels, ...)
         #   output is (batch, out_channels, ...)
-        # quantize along the batch dim
+        # Quantize over the physical last dimension for layout-dependent MX grouping.
         qex_input = quantize_mx_op(
             input,
             ctx.mx_specs,
             elem_format=ctx.mx_specs['a_elem_format'],
-            axes=[0],
+            axes=[_physical_last_axis(input)],
         )
         qex_grad_output = quantize_mx_op(
             grad_output,
             ctx.mx_specs,
             elem_format=ctx.mx_specs['a_elem_format'],
-            axes=[0],
+            axes=[_physical_last_axis(grad_output)],
         )
 
         # compute grad_weight
@@ -337,18 +338,18 @@ class ConvFunction(torch.autograd.Function):
         # grad_input = conv_transpose2d(output, weight)
         #   weight is (out_channels, in_channels/groups, ...)
         #   output is (batch, out_channels, ...)
-        # reduction dim is out_channels
+        # Quantize over the physical last dimension for layout-dependent MX grouping.
         qod_weight = quantize_mx_op(
             weight,
             ctx.mx_specs,
             elem_format=ctx.mx_specs['w_elem_format'],
-            axes=[0],
+            axes=[_physical_last_axis(weight)],
         )
         qod_grad_output = quantize_mx_op(
             grad_output,
             ctx.mx_specs,
             elem_format=ctx.mx_specs['a_elem_format'],
-            axes=[1],
+            axes=[_physical_last_axis(grad_output)],
         )
 
         # compute grad_input

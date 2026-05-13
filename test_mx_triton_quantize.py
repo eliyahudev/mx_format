@@ -4,7 +4,12 @@ try:
     import torch
     import torch.nn.functional as F
     from microxcaling.mx.formats import _get_format_params
-    from microxcaling.mx.mx_ops import _quantize_mx, _reshape_to_blocks, _shared_exponents
+    from microxcaling.mx.mx_ops import (
+        _physical_last_axis,
+        _quantize_mx,
+        _reshape_to_blocks,
+        _shared_exponents,
+    )
     from mx_triton_conv2d import (
         mxint8_conv2d_triton,
         quantize_mxint8_last_axis_blocks,
@@ -15,6 +20,7 @@ except ModuleNotFoundError:
     torch = None
     F = None
     _get_format_params = None
+    _physical_last_axis = None
     _quantize_mx = None
     _reshape_to_blocks = None
     _shared_exponents = None
@@ -40,8 +46,16 @@ class MXTritonQuantizeTest(unittest.TestCase):
         ])
         x_hwc = x_chw.permute(1, 2, 0).contiguous()
 
-        chw_max = self._blocked_abs_max_values(x_chw, axis=-1, block_size=2)
-        hwc_max = self._blocked_abs_max_values(x_hwc, axis=-1, block_size=2)
+        chw_max, chw_exp = self._blocked_abs_max_and_exp_values(
+            x_chw,
+            axis=_physical_last_axis(x_chw),
+            block_size=2,
+        )
+        hwc_max, hwc_exp = self._blocked_abs_max_and_exp_values(
+            x_hwc,
+            axis=_physical_last_axis(x_hwc),
+            block_size=2,
+        )
 
         expected_chw = torch.tensor([
             [[12.0], [12.0]],
@@ -54,8 +68,37 @@ class MXTritonQuantizeTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(chw_max, expected_chw))
         self.assertTrue(torch.equal(hwc_max, expected_hwc))
+        self.assertFalse(torch.equal(chw_exp, hwc_exp))
 
-    def _blocked_abs_max_values(self, x, *, axis, block_size):
+    def test_physical_last_axis_int8_quantization_differs_by_layout(self):
+        x_chw = torch.tensor([
+            [[1.0, 12.0], [1.0, 12.0]],
+            [[4069.0, 4080.0], [4069.0, 4080.0]],
+        ])
+        x_hwc = x_chw.permute(1, 2, 0).contiguous()
+
+        q_chw = _quantize_mx(
+            x_chw,
+            scale_bits=8,
+            elem_format="int8",
+            axes=[_physical_last_axis(x_chw)],
+            block_size=2,
+            round="nearest",
+            custom_cuda=False,
+        )
+        q_hwc = _quantize_mx(
+            x_hwc,
+            scale_bits=8,
+            elem_format="int8",
+            axes=[_physical_last_axis(x_hwc)],
+            block_size=2,
+            round="nearest",
+            custom_cuda=False,
+        )
+
+        self.assertFalse(torch.equal(q_chw, q_hwc.permute(2, 0, 1).contiguous()))
+
+    def _blocked_abs_max_and_exp_values(self, x, *, axis, block_size):
         blocked, blocked_axes, _, _ = _reshape_to_blocks(x, [axis], block_size)
         shared_exp_axes = [blocked_axis + 1 for blocked_axis in blocked_axes]
         max_values = blocked.abs().max(dim=shared_exp_axes[0], keepdim=True).values
@@ -69,7 +112,7 @@ class MXTritonQuantizeTest(unittest.TestCase):
         expected_exp = torch.floor(torch.log2(max_values))
         self.assertTrue(torch.equal(shared_exp, expected_exp))
 
-        return max_values.squeeze(shared_exp_axes[0])
+        return max_values.squeeze(shared_exp_axes[0]), shared_exp.squeeze(shared_exp_axes[0])
 
     def _reconstruct_last_axis_mxint(self, raw):
         scale_index = torch.arange(raw.elements.shape[-1], device=raw.elements.device) // raw.block_size

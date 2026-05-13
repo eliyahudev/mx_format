@@ -18,6 +18,7 @@ Exposed Methods:
 
 Internal Methods:
     _safe_lshift, _safe_rshift - fp16 compatible shifts
+    _physical_last_axis - Returns the physical last axis of a tensor
     _shared_exponents - Returns MX shared exponent for the passed tensor
     _reshape_to_blocks - tiles a tensor by splitting one dim into two
     _undo_reshape_to_blocks - undos the above reshaping
@@ -46,6 +47,11 @@ from .elemwise_ops import (
 # -------------------------------------------------------------------------
 # Helper funcs
 # -------------------------------------------------------------------------
+def _physical_last_axis(A):
+    """Return the physical last axis used for layout-dependent MX grouping."""
+    return A.ndim - 1
+
+
 def _shared_exponents(A, method="max", axes=None, ebits=0):
     """
     Get shared exponents for the passed matrix A.
