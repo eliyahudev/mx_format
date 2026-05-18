@@ -120,9 +120,9 @@ class ConvFunction(torch.autograd.Function):
         input_layout = mx_specs["conv2d_input_layout"]
         if input_layout not in ("nchw", "nhwc"):
             raise ValueError("INT_OPS Conv2d mx_specs['conv2d_input_layout'] must be 'nchw' or 'nhwc'")
-        supported_int_formats = ("int8", "int16")
+        supported_int_formats = ("int8", "int12", "int16")
         if mx_specs["a_elem_format"] not in supported_int_formats or mx_specs["w_elem_format"] not in supported_int_formats:
-            raise ValueError("INT_OPS Conv2d currently supports only int8 or int16 element formats")
+            raise ValueError("INT_OPS Conv2d currently supports only int8, int12, or int16 element formats")
         if mx_specs["shared_exp_method"] != "max":
             raise ValueError("INT_OPS Conv2d currently supports shared_exp_method='max'")
         if input.device.type != "cuda" or weight.device.type != "cuda":

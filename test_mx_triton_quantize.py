@@ -39,6 +39,13 @@ class MXTritonQuantizeTest(unittest.TestCase):
         self.assertEqual(mbits, 16)
         self.assertEqual(emax, 0)
 
+    def test_int12_format_params(self):
+        ebits, mbits, emax, _, _ = _get_format_params("int12")
+
+        self.assertEqual(ebits, 0)
+        self.assertEqual(mbits, 12)
+        self.assertEqual(emax, 0)
+
     def test_physical_last_axis_shared_exponent_differs_by_layout(self):
         x_chw = torch.tensor([
             [[1.0, 12.0], [1.0, 12.0]],
@@ -186,6 +193,61 @@ class MXTritonQuantizeTest(unittest.TestCase):
         self.assertEqual(raw.elem_format, "int16")
         self.assertEqual(raw.elem_mbits, 16)
         self.assertTrue(torch.allclose(reconstructed, reference, equal_nan=True))
+
+    @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA is required")
+    def test_mxint12_raw_payload_reconstructs_microxcaling_quantized_values(self):
+        torch.manual_seed(0)
+        x = torch.randn(2, 35, 4, 4, device="cuda")
+
+        reference = _quantize_mx(
+            x,
+            scale_bits=8,
+            elem_format="int12",
+            axes=[-1],
+            block_size=32,
+            round="nearest",
+            custom_cuda=False,
+        )
+        raw = quantize_mxint_channel_blocks(
+            x,
+            axis=-1,
+            elem_format="int12",
+            block_size=32,
+            scale_bits=8,
+            round="nearest",
+        )
+
+        scale_index = torch.arange(x.shape[-1], device=x.device) // raw.block_size
+        expanded_exponents = raw.scales.index_select(-1, scale_index)
+        expanded_scales = torch.exp2(expanded_exponents.float() - 10.0)
+        reconstructed = raw.elements.float() * expanded_scales
+
+        self.assertEqual(raw.elements.dtype, torch.int16)
+        self.assertFalse(raw.scales.dtype.is_floating_point)
+        self.assertEqual(tuple(raw.scales.shape), (2, 35, 4, 1))
+        self.assertEqual(raw.elem_format, "int12")
+        self.assertEqual(raw.elem_mbits, 12)
+        self.assertTrue(torch.allclose(reconstructed, reference, equal_nan=True))
+
+    @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA is required")
+    def test_mxint12_represents_4094_exactly_when_block_max(self):
+        x = torch.tensor([4094.0, 1024.0], device="cuda")
+
+        raw = quantize_mxint_channel_blocks(
+            x,
+            axis=-1,
+            elem_format="int12",
+            block_size=2,
+            scale_bits=8,
+            round="nearest",
+        )
+        reconstructed = self._reconstruct_last_axis_mxint(raw)
+
+        self.assertEqual(raw.elements.dtype, torch.int16)
+        self.assertEqual(raw.elem_mbits, 12)
+        self.assertEqual(raw.elements[0].item(), 2047)
+        self.assertEqual(raw.scales[0].item(), 11)
+        self.assertEqual(reconstructed[0].item(), 4094.0)
 
     @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA is required")
     def test_triton_conv2d_matches_last_axis_reconstruction_nchw(self):

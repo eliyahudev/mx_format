@@ -27,11 +27,18 @@ INT16_OPS_SPECS = dict(INT_OPS_SPECS)
 INT16_OPS_SPECS["w_elem_format"] = "int16"
 INT16_OPS_SPECS["a_elem_format"] = "int16"
 
+INT12_OPS_SPECS = dict(INT_OPS_SPECS)
+INT12_OPS_SPECS["w_elem_format"] = "int12"
+INT12_OPS_SPECS["a_elem_format"] = "int12"
+
 MIXED_A8_W16_OPS_SPECS = dict(INT_OPS_SPECS)
 MIXED_A8_W16_OPS_SPECS["w_elem_format"] = "int16"
 
 MIXED_A16_W8_OPS_SPECS = dict(INT_OPS_SPECS)
 MIXED_A16_W8_OPS_SPECS["a_elem_format"] = "int16"
+
+MIXED_A12_W8_OPS_SPECS = dict(INT_OPS_SPECS)
+MIXED_A12_W8_OPS_SPECS["a_elem_format"] = "int12"
 
 
 @unittest.skipIf(torch is None, "torch is required for INT_OPS Conv2d tests")
@@ -90,6 +97,13 @@ class IntOpsConv2dTest(unittest.TestCase):
         self._assert_backward_grads(conv, x)
 
     @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA is required")
+    def test_int12_ops_conv2d_forward_and_backward(self):
+        conv = Conv2d(32, 8, kernel_size=3, padding=1, mx_specs=INT12_OPS_SPECS).cuda()
+        x = torch.randn(2, 32, 16, 16, device="cuda", requires_grad=True)
+
+        self._assert_backward_grads(conv, x)
+
+    @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA is required")
     def test_int_ops_nhwc_conv2d_forward_and_backward(self):
         specs = dict(INT_OPS_SPECS)
         specs["conv2d_input_layout"] = "nhwc"
@@ -124,7 +138,7 @@ class IntOpsConv2dTest(unittest.TestCase):
         conv = Conv2d(32, 8, kernel_size=3, padding=1, mx_specs=specs)
         x = torch.randn(2, 32, 16, 16)
 
-        with self.assertRaisesRegex(ValueError, "only int8 or int16"):
+        with self.assertRaisesRegex(ValueError, "only int8, int12, or int16"):
             conv(x)
 
     @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA is required")
@@ -137,6 +151,13 @@ class IntOpsConv2dTest(unittest.TestCase):
     @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA is required")
     def test_int_ops_accepts_activation_int16_weight_int8(self):
         conv = Conv2d(32, 8, kernel_size=3, padding=1, mx_specs=MIXED_A16_W8_OPS_SPECS).cuda()
+        x = torch.randn(2, 32, 16, 16, device="cuda", requires_grad=True)
+
+        self._assert_backward_grads(conv, x)
+
+    @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA is required")
+    def test_int_ops_accepts_activation_int12_weight_int8(self):
+        conv = Conv2d(32, 8, kernel_size=3, padding=1, mx_specs=MIXED_A12_W8_OPS_SPECS).cuda()
         x = torch.randn(2, 32, 16, 16, device="cuda", requires_grad=True)
 
         self._assert_backward_grads(conv, x)

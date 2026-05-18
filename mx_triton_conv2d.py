@@ -4,7 +4,7 @@ This example is intentionally narrower than Microsoft's `microxcaling` layers:
 it keeps activations and weights as integer MX elements plus shared exponent
 blocks, then applies those exponents inside a Triton convolution accumulator.
 
-The implemented formats are MXINT8/MXINT16-style:
+The implemented formats are MXINT8/MXINT12/MXINT16-style:
     real_value ~= int_element * 2 ** (shared_exp - (element_bits - 2))
 
 Supported convolution shape for this example:
@@ -105,7 +105,7 @@ def quantize_mxint_channel_blocks(
     Args:
         tensor: CUDA activation or weight tensor to quantize.
         axis: Physical tensor axis to block.
-        elem_format: Integer MX element format. Supported: "int8" or "int16".
+        elem_format: Integer MX element format. Supported: "int8", "int12", or "int16".
         block_size: Number of values sharing one scale along `axis`.
         scale_bits: Number of bits used by the shared MX exponent.
         round: Rounding mode passed to microxcaling's elementwise core.
@@ -121,8 +121,8 @@ def quantize_mxint_channel_blocks(
         axis += tensor.ndim
     if axis < 0 or axis >= tensor.ndim:
         raise ValueError("MXINT quantization axis is out of range")
-    if elem_format not in ("int8", "int16"):
-        raise ValueError("MX Triton quantization currently supports elem_format 'int8' or 'int16'")
+    if elem_format not in ("int8", "int12", "int16"):
+        raise ValueError("MX Triton quantization currently supports elem_format 'int8', 'int12', or 'int16'")
     if block_size <= 0:
         raise ValueError("MXINT quantization expects block_size > 0")
     if scale_bits <= 0:
