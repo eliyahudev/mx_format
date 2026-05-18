@@ -48,16 +48,52 @@ else:
         return finalized
 
 
-    fake_mx = types.ModuleType("mx")
+    class OldTopLevelMXConv2d(nn.Conv2d):
+        def __init__(self, *args, mx_specs, name, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.mx_specs = mx_specs
+            self.mx_name = name
+
+
+    def old_top_level_finalize_mx_specs(mx_specs):
+        if "int_ops" in mx_specs:
+            raise KeyError("Unknown key 'int_ops' passed to mx specs")
+        return dict(mx_specs)
+
+
+    fake_microxcaling = types.ModuleType("microxcaling")
+    fake_microxcaling.__path__ = []
+    fake_mx = types.ModuleType("microxcaling.mx")
     fake_mx.Conv1d = FakeMXConv1d
     fake_mx.Conv2d = FakeMXConv2d
     fake_mx.Conv3d = FakeMXConv3d
     fake_mx.finalize_mx_specs = fake_finalize_mx_specs
-    sys.modules["mx"] = fake_mx
+
+    old_top_level_mx = types.ModuleType("mx")
+    old_top_level_mx.Conv1d = FakeMXConv1d
+    old_top_level_mx.Conv2d = OldTopLevelMXConv2d
+    old_top_level_mx.Conv3d = FakeMXConv3d
+    old_top_level_mx.finalize_mx_specs = old_top_level_finalize_mx_specs
+
+    _MISSING = object()
+    saved_modules = {
+        name: sys.modules.get(name, _MISSING)
+        for name in ("microxcaling", "microxcaling.mx", "mx")
+    }
+    sys.modules["microxcaling"] = fake_microxcaling
+    sys.modules["microxcaling.mx"] = fake_mx
+    sys.modules["mx"] = old_top_level_mx
 
     if "mx_conv_replacement" in sys.modules:
         del sys.modules["mx_conv_replacement"]
-    mx_conv_replacement = importlib.import_module("mx_conv_replacement")
+    try:
+        mx_conv_replacement = importlib.import_module("mx_conv_replacement")
+    finally:
+        for module_name, saved_module in saved_modules.items():
+            if saved_module is _MISSING:
+                sys.modules.pop(module_name, None)
+            else:
+                sys.modules[module_name] = saved_module
 
 
     class TinyConvModel(nn.Module):
@@ -109,6 +145,40 @@ else:
             self.assertEqual(converted.features[0].mx_name, "0")
             self.assertTrue(converted.features[0].mx_specs["_finalized"])
 
+        def test_prefers_repo_local_microxcaling_mx_over_old_top_level_mx(self):
+            converted = mx_conv_replacement.replace_conv_layers_with_mx(
+                TinyConvModel(),
+                mx_specs={"block_size": 8},
+            )
+
+            self.assertIsInstance(converted.conv1, FakeMXConv2d)
+            self.assertNotIsInstance(converted.conv1, OldTopLevelMXConv2d)
+
+        def test_config_preserves_int_ops_specs(self):
+            config_path = self.write_config(
+                {
+                    "default": {
+                        "w_elem_format": "int16",
+                        "a_elem_format": "int16",
+                        "int_ops": True,
+                        "acc_bits": 32,
+                    },
+                    "layers": {
+                        "features.0": {"conv2d_input_layout": "nhwc"},
+                    },
+                }
+            )
+
+            converted = mx_conv_replacement.replace_conv_layers_with_mx(
+                TinyConvModel(),
+                config_path=config_path,
+            )
+
+            self.assertTrue(converted.conv1.mx_specs["int_ops"])
+            self.assertEqual(converted.conv1.mx_specs["acc_bits"], 32)
+            self.assertEqual(converted.features[0].mx_specs["conv2d_input_layout"], "nhwc")
+            self.assertTrue(converted.features[0].mx_specs["_finalized"])
+
         def test_unmatched_layer_override_raises(self):
             config_path = self.write_config({"layers": {"missing.conv": {"block_size": 16}}})
 
@@ -136,6 +206,19 @@ else:
                     mx_specs={"block_size": 8},
                     config_path=config_path,
                 )
+
+        def test_old_mx_int_ops_error_is_actionable(self):
+            original_finalize_mx_specs = mx_conv_replacement.finalize_mx_specs
+            mx_conv_replacement.finalize_mx_specs = old_top_level_finalize_mx_specs
+            self.addCleanup(
+                setattr,
+                mx_conv_replacement,
+                "finalize_mx_specs",
+                original_finalize_mx_specs,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "does not recognize mx_specs\\['int_ops'\\]"):
+                mx_conv_replacement.make_mx_specs({"int_ops": True})
 
 
 if __name__ == "__main__":

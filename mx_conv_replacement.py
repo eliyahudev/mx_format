@@ -15,7 +15,20 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from mx import Conv1d, Conv2d, Conv3d, finalize_mx_specs
+
+def _load_mx_conv_api():
+    """Load the MX conv API, preferring this repo's microxcaling package."""
+    try:
+        from microxcaling.mx import Conv1d, Conv2d, Conv3d, finalize_mx_specs
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"microxcaling", "microxcaling.mx"}:
+            raise
+        from mx import Conv1d, Conv2d, Conv3d, finalize_mx_specs
+
+    return Conv1d, Conv2d, Conv3d, finalize_mx_specs
+
+
+Conv1d, Conv2d, Conv3d, finalize_mx_specs = _load_mx_conv_api()
 
 
 DEFAULT_MX_SPECS = {
@@ -36,6 +49,20 @@ _CONV_REPLACEMENTS = {
 }
 
 
+def _finalize_mx_specs(mx_specs: dict) -> dict:
+    """Finalize MX specs with a clearer message for old MX versions."""
+    try:
+        return finalize_mx_specs(mx_specs)
+    except KeyError as exc:
+        if mx_specs.get("int_ops"):
+            raise RuntimeError(
+                "The loaded MX package does not recognize mx_specs['int_ops']. "
+                "Use this repository's microxcaling.mx package, or update the "
+                "installed mx package to a version that supports INT_OPS."
+            ) from exc
+        raise
+
+
 def make_mx_specs(overrides: dict | None = None) -> dict:
     """Create the finalized MX config used when building replacement convs.
 
@@ -46,7 +73,7 @@ def make_mx_specs(overrides: dict | None = None) -> dict:
     mx_specs = dict(DEFAULT_MX_SPECS)
     if overrides:
         mx_specs.update(overrides)
-    return finalize_mx_specs(mx_specs)
+    return _finalize_mx_specs(mx_specs)
 
 
 def _load_mx_config(config_path: str | Path) -> tuple[dict, dict[str, dict]]:
@@ -157,7 +184,7 @@ def _replace_conv_layers_with_mx(
             raw_specs = dict(default_specs)
             if module_path in layer_overrides:
                 raw_specs.update(layer_overrides[module_path])
-            mx_child = _build_mx_conv(child, finalize_mx_specs(raw_specs), name=module_name)
+            mx_child = _build_mx_conv(child, _finalize_mx_specs(raw_specs), name=module_name)
             setattr(model, module_name, mx_child)
         else:
             _replace_conv_layers_with_mx(
